@@ -1,0 +1,3 @@
+﻿interface:
+  display_name: "YOLOv11 工服检测约束"
+  short_description: "编码前先读 docs，并按 YOLOv11 工服检测标准实现"
