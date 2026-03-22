@@ -5,6 +5,99 @@
 
 ---
 
+## 2026-03-22  Section 4 小改：四个文件的 YOLOv11 工服检测适配
+
+### 改动背景
+
+基于 `docs/yolov11_migration_reuse_rewrite.md` 第四部分的建议，对"适合小改"的四个文件进行语义和配置层面的改造，将残留的警务系统耦合替换为加油站工服检测语义。不涉及 import 解析问题（其余文件尚未加入工程）。
+
+---
+
+### 1. `inspection-flask/setting.py`
+
+**改动类型**：配置重命名 + 警务配置注释化 + 新增工服检测常量
+
+**改动内容**：
+
+- `YI_WEIGHT` 重命名为 `PERSON_WEIGHT`，权重路径指向 `person_detect.pt`
+- `CLOTH_WEIGHT` 重命名为 `WORKWEAR_WEIGHT`，权重路径指向 `workwear_detect.pt`
+- `ER_WEIGHT`、`POSE_WEIGHT` 注释掉，标注"警务专用，已弃用"
+- `SMOKE_CONF`、`PHONE_CONF`、`LYING_CONF`、`FACE_CONF`、`CLOTH_CONF` 注释掉，标注"警务专用阈值"
+- 新增 `WORKWEAR_CONF = 0.45`（工服检测置信度阈值）
+- 新增 `WORKWEAR_LABELS`（合规工服类别列表，配置驱动）
+- 新增 `MIN_PERSON_BOX_AREA = 3000`（人员框最小像素面积过滤）
+- 新增 `TEMPORAL_WINDOW_SIZE = 5`、`TEMPORAL_TRIGGER_RATIO = 0.6`（时序稳定性参数）
+- 新增 `WORKWEAR_VIOLATION_TYPE = "workwear_missing"`（违规规则编码）
+- 新增 `alert_suppression_seconds = 300`（告警抑制窗口）
+- 新增 `thread_idle_sleep = 2`（检测线程空闲轮询间隔）
+- 新增 `DEFAULT_CAMERA_PORT = 8000`、`DEFAULT_CAMERA_CHANNEL = 1`（供 `models.py` HKCamera dataclass 使用）
+- 用分区注释块重新组织全文，提升可读性
+
+**改动原因**：  
+`hk_custom_threading_plus.py`、`models.py` 等已重写文件依赖上述新常量；旧权重名称保留为注释，便于追溯原 YOLOv5 配置。
+
+---
+
+### 2. `inspection-flask/applications/__init__.py`
+
+**改动类型**：初始化恢复 + 模型加载 TODO 化 + 旧 YOLOv5 import 注释化
+
+**改动内容**：
+
+- 旧 YOLOv5 imports（`Lying_Detect`、`get_all_models`、`select_device`、`FaceRecognition`、`Camera`）保留但转为注释，各行标注"已弃用"或"待补齐后按需恢复"
+- 模型加载注释块改写为 TODO 格式：变量名从 `person_detect_model`/`cloth_detect_model` 改为 `person_model`/`workwear_model`；`smoke_phone_detect_model`、`pose_net`、`lying_model`、`face_detect_model` 标注"警务专用，已弃用"；说明待 `utils/models_v11.py` 编写后解注释
+- **解注释并激活**（不依赖模型）：
+  - `ThreadManager()` 初始化 + `bind_app(app)`，写入 `app.config['hk_threadManager']`
+  - `app.config['hk_images'] = {}`、`app.config['hk_images_datetime'] = {}`
+  - `HKRecorderThreadManager()` 初始化 + `bind_app(app)`，写入 `app.config['hk_recorder_thread_manager']`
+  - 新增 `app.config['violation_events'] = []`（全局违规事件队列）
+  - 新增 `app.config['camera_registry'] = {}`（启用摄像头注册表）
+- **解注释并激活** `BackgroundScheduler`：
+  - 按 `settings.get_image_interval` 周期调度 `hk_recorder_thread_manager.run()`
+  - 凌晨 4 点 cron 触发 `hk_threadManager.restart_all_threads()`
+  - 延迟 2 个采集周期的一次性 date 触发重启，确保摄像头初始化后再检测
+
+**改动原因**：  
+`hk_camera.py` 的 `enable`/`disable` 路由依赖 `hk_threadManager`；图像缓存和调度器不依赖模型，可直接激活；模型加载待第二阶段 `utils/models_v11.py` 完成后再解注释。
+
+---
+
+### 3. `inspection-flask/applications/models/admin_violate_photo.py`
+
+**改动类型**：ORM 模型升级（外键修正 + 新增字段 + 注释清理）
+
+**改动内容**：
+
+- `camera_id` 外键：`db.ForeignKey("admin_camera.id")` → `db.ForeignKey("admin_hk_camera.id")`；comment 改为"海康摄像头ID"，并补充说明"原 admin_camera 已由 admin_hk_camera 替代"
+- `station_id` comment：`"询问室ID"` → `"监控站点ID"`
+- `dept_id` comment：`"部门ID"` → `"所属单位ID"`（FK 表名 `admin_police_station` 暂保留，待后续统一迁移）
+- 新增 `rule_code = db.Column(db.String(64), nullable=True, comment='违规规则编码，如 workwear_missing')`
+- 新增 `rule_name = db.Column(db.String(100), nullable=True, comment='违规规则名称，如 未穿工服')`
+- 注释掉的 camera relationship 更新为指向 `HKCamera`（`admin_hk_camera`）的预留注释
+- 移除已无意义的旧 `load_only` import
+
+**改动原因**：  
+海康检测链路写入的 `camera_id` 来自 `admin_hk_camera`，原外键指向 `admin_camera` 会导致数据库外键约束失败；`rule_code`/`rule_name` 字段使违规记录具备自描述能力，不再依赖 `violate_id` 反查规则名称。
+
+---
+
+### 4. `inspection-flask/violation_module/base.py`
+
+**改动类型**：接口修复 + 旧警务注释清理
+
+**改动内容**：
+
+- `save()` 调用 `save_violate_photo()` 时补传 `rule_name=name`，使日志和数据库中实际展示违规名称，而非"违规类型xxx"占位
+- 类属性及 `__init__` 中注释清理：
+  - `"审讯室/值班室id"` → `"监控站点id"`
+  - `"单位id 例如：xx派出所"` → `"所属单位id"`
+  - `"部门id 例如：东营市公安分局"` → `"上级单位id"`
+
+**改动原因**：  
+`save_violate_photo()` 已在上一版本扩展了 `rule_name` 参数，但 `base.py` 的调用处未同步传入，导致该参数形同虚设；注释中的警务描述与加油站场景语义不符，影响代码可读性。
+
+---
+
 ## 2026-03-22  `base.py` 与 `hk_camera.py` 适配 YOLOv11 工服检测场景
 
 ### 改动背景

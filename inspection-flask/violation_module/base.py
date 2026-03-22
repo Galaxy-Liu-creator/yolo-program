@@ -38,11 +38,11 @@ class BaseVio(metaclass=ABCMeta):
     datatime_list = []
     # 对应frame的检测结果
     targets = []
-    # 审讯室/值班室id
+    # 监控站点id
     station_id = ""
-    # 单位id 例如：xx派出所
+    # 所属单位id
     dept_id = ""
-    # 部门id 例如：东营市公安分局
+    # 上级单位id
     sub_id = ""
     # 存放符合违规的信息
     plot_targets = {}
@@ -57,11 +57,11 @@ class BaseVio(metaclass=ABCMeta):
         self.datatime_list = []
         # 对应frame的检测结果
         self.targets = []
-        # 审讯室/值班室id
+        # 监控站点id
         self.station_id = ""
-        # 单位id 例如：xx派出所
+        # 所属单位id
         self.dept_id = ""
-        # 部门id 例如：东营市公安分局
+        # 上级单位id
         self.sub_id = ""
         # 存放符合违规的信息
         self.plot_targets = {}
@@ -132,7 +132,8 @@ class BaseVio(metaclass=ABCMeta):
                 save_violate_photo(self.vio_type, self.camera_id, vio_image,
                                    self.station_id, self.dept_id, self.sub_id,
                                    settings.VIO_IMAGE_PATH,
-                                   self.datetime_list[max_conf_each])
+                                   self.datetime_list[max_conf_each],
+                                   rule_name=name)
         self.plot_targets.clear()
         return None
     # def save(self, image, vio_name, targets=None):
