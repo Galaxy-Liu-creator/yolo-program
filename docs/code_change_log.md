@@ -5,6 +5,150 @@
 
 ---
 
+## 2026-03-24  Section 5 重写：四个核心文件的 YOLOv11 工服检测迁移
+
+### 改动背景
+
+基于 `docs/yolov11_migration_reuse_rewrite.md` 第五部分，对四个必须重写的文件执行完整迁移，删除 YOLOv5 警务推理封装、警服/人脸规则逻辑和旧检测编排，替换为 YOLOv11 加油站工服检测的完整链路。同步新增白底遮罩开关，使两种预处理方式可通过配置并存切换。
+
+---
+
+### 1. `inspection-flask/utils/models.py`
+
+**改动类型**：完全重写
+
+**改动内容**：
+
+- 删除所有 YOLOv5 依赖：`attempt_load`、`seek_targets`、`seek_target`、`get_all_models`、`get_models`、`get_posemodels`、`PoseEstimationWithMobileNet`、`letterbox`、`non_max_suppression`、`scale_coords` 等全部移除
+- 新增 `PersonDetector` 类：
+  - `__init__(weight_path, device)` 使用 `ultralytics.YOLO` 加载人员检测权重
+  - `infer(frame, conf_threshold=0.55) -> list[dict]`：对整帧检测人员，输出统一格式 `{"bbox": [x1,y1,x2,y2], "confidence": float, "label": "person"}`，自动过滤非 `person` 标签
+- 新增 `WorkwearDetector` 类：
+  - `__init__(weight_path, device)` 使用 `ultralytics.YOLO` 加载工服检测权重
+  - `infer(person_crop, conf_threshold=0.45) -> list[dict]`：对人员裁剪图检测工服，输出统一格式，坐标为裁剪图局部坐标
+- 新增 `load_person_detector(device)` 工厂函数，读取 `settings.PERSON_WEIGHT`
+- 新增 `load_workwear_detector(device)` 工厂函数，读取 `settings.WORKWEAR_WEIGHT`
+- 新增 `select_runtime_device()` 函数，自动选择 `cuda:0` 或 `cpu`
+
+**改动原因**：  
+原文件使用 `attempt_load` 等 YOLOv5 专有 API，与 YOLOv11（ultralytics）完全不兼容；新接口对上层屏蔽底层模型版本，后续换模型不影响检测编排层。
+
+---
+
+### 2. `inspection-flask/applications/common/hk_custom_threading_plus.py`
+
+**改动类型**：重写检测编排 + 修复三处问题 + 新增白底遮罩开关
+
+**改动内容**：
+
+**新增模块级辅助函数 `_make_white_bg_crop(frame, bbox)`**：
+- 将帧中人员框外区域替换为白色后裁剪，对应原 YOLOv5 `add_white_background` 逻辑
+- 当 `settings.USE_WHITE_BG_MASK=True` 时由 `build_person_contexts()` 调用
+
+**`build_person_contexts()` 新增白底遮罩开关**：
+- 读取 `getattr(settings, "USE_WHITE_BG_MASK", False)`
+- `True`：使用 `_make_white_bg_crop()` 裁剪；`False`（默认）：使用 `_crop_person()` 直接裁剪
+- `has_workwear` 判定：从 `workwear_items` 中过滤 `label in WORKWEAR_LABELS` 的命中，而非单纯判空（确保未训练类别不算合规）
+
+**`restart_all_threads()` 修复**：
+- 原版使用 `app.config["camera_registry"]`，不保证初始化、可能 KeyError
+- 改为 `HKCamera.query.filter_by(is_delete=0, enable=1).all()` 直接查数据库，与旧版逻辑对齐
+
+**`emit_event()` 修复**：
+- 原版要求 `event` 必须是 `dict`，但 `violation.run()` 触发时返回 `True`（保存已在 `base.py` 完成）
+- 改为接受任意真值，日志直接输出摄像头告警信息
+
+**告警抑制修复**：
+- 原 `if event:` 因 `save()` 返回 `None` 永不进入，`self.last_alert_ts` 从不更新，抑制逻辑失效
+- 现 `base.py.save()` 触发时返回 `True`，`triggered = violation.run()` 可正确更新 `last_alert_ts`
+
+**改动原因**：  
+原检测编排依赖警服/人脸/姿态等警务语义，且三处逻辑 Bug 导致告警抑制永不生效；新版重写后语义正确、链路完整。
+
+---
+
+### 3. `inspection-flask/violation_module/vio_zsmjwcjf.py`
+
+**改动类型**：完全重写
+
+**改动内容**：
+
+- 删除 `TestNoClothesViolation`、`NoClothesViolation` 等警务规则类及所有人脸依赖逻辑
+- 新建 `WorkwearMissingViolation(BaseVio)` 类，`rule_code = "workwear_missing"`，`rule_name = "未穿工服"`
+- `run()` 方法实现三层判定逻辑：
+  1. 人员有效性过滤：跳过 `area < MIN_PERSON_BOX_AREA` 或 `in_roi=False` 的目标
+  2. 单帧工服判定：`workwear_items` 中任一 `label in WORKWEAR_LABELS` 即为合规，否则记为违规候选并调用 `_add_person_to_plot()` 记入 `plot_targets`
+  3. 时序比例判定：`违规帧数 / 窗口总帧数 >= TEMPORAL_TRIGGER_RATIO` 时调用 `self.save("未穿工服")` 保存证据图，返回 `True`；未达阈值时清空 `plot_targets` 返回 `None`
+- 新增私有方法 `_add_person_to_plot(frame_idx, person)` 将违规人员信息格式化后写入 `plot_targets`，供 `base.save()` 选取最优证据帧
+
+**改动原因**：  
+原文件语义为"未穿警服"，依赖人脸检测前置，不适合加油站场景（工人转身、遮挡均会导致大量漏报）；新规则去除人脸依赖，改用工服标签直接判定。
+
+---
+
+### 4. 新建 `inspection-flask/violation_module/vio_workwear_missing.py`
+
+**改动类型**：新增文件
+
+**改动内容**：
+
+- 单行重导出：`from violation_module.vio_zsmjwcjf import WorkwearMissingViolation`
+- 使 `hk_custom_threading_plus.py` 中 `from violation_module.vio_workwear_missing import WorkwearMissingViolation` 的导入路径有效，同时保持规则实现集中在 `vio_zsmjwcjf.py`
+
+**改动原因**：  
+导入路径与文档推荐命名对齐；规则实现只在一处维护，避免同步问题。
+
+---
+
+### 5. `inspection-flask/applications/common/logic_judge.py`
+
+**改动类型**：完全重写
+
+**改动内容**：
+
+- 删除所有警务/RTSP 相关函数：`get_standard_res`、`get_standard_person_res`、`get_standard_cloth_res`、`judging_cloth`、`draw_boxes`（含人脸 bbox 逻辑）
+- 新增 `is_box_overlap(box_a, box_b) -> float`：计算两框 IoU，供调试和扩展复用
+- 新增 `has_compliant_workwear(person_context, workwear_labels) -> bool`：判断单个人员上下文是否包含合规工服（与 `vio_zsmjwcjf.py` 判定逻辑一致，供外部复用）
+- 新增 `count_violation_frames(window, workwear_labels, min_area) -> int`：统计时间窗口内违规帧数，供测试和调试使用
+- 新增 `draw_person_workwear_boxes(frame, person_contexts) -> np.ndarray`：绘制人员框（合规绿色/违规红色）和工服框（绿色），workwear_items bbox 自动换算为原帧坐标，供调试可视化
+
+**改动原因**：  
+原文件依赖 YOLOv5 的 pandas 输出格式（`res.pandas().xyxy[0]`），与新系统统一字典格式完全不兼容；新工具函数围绕 `person_context` 字典结构设计，与主检测链路语义一致。
+
+---
+
+### 6. `inspection-flask/setting.py`
+
+**改动类型**：新增配置项
+
+**改动内容**：
+
+- 在"工服检测业务配置"区块的 `WORKWEAR_LABELS` 之后、`MIN_PERSON_BOX_AREA` 之前新增：
+  ```python
+  USE_WHITE_BG_MASK = False
+  ```
+- 附带三行注释说明 `True`/`False` 两种模式的适用场景及与原 YOLOv5 逻辑的对应关系
+
+**改动原因**：  
+新旧工服模型的训练数据格式可能不同（白底 vs 真实场景），通过配置项切换而非硬编码，避免将来换模型时需要改代码。
+
+---
+
+### 7. `inspection-flask/violation_module/base.py`
+
+**改动类型**：Bug 修复（返回值）
+
+**改动内容**：
+
+- `save()` 方法：当实际触发保存时，在 `save_violate_photo()` 调用之后返回 `True`（原代码统一返回 `None`）
+- 未触发时仍返回 `None`
+- 清空 `plot_targets` 的逻辑拆分到两个返回路径各自执行，不改变保存链路行为
+
+**改动原因**：  
+`hk_custom_threading_plus.py` 的告警抑制依赖 `triggered = violation.run()` 的真值来更新 `self.last_alert_ts`；原 `save()` 始终返回 `None` 导致抑制逻辑永不生效，同一摄像头会在短时间内重复报警。
+
+---
+
 ## 2026-03-22  Section 4 小改：四个文件的 YOLOv11 工服检测适配
 
 ### 改动背景

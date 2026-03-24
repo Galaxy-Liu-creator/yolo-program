@@ -26,6 +26,10 @@ alwaysApply: true
 
 如果任务范围较小，可以优先读取最相关章节，但不能跳过文档检查。
 
+@docs/yolov11_workwear_system_design.md
+@docs/yolov11_migration_reuse_rewrite.md
+@docs/code_change_log.md
+
 # 强制实现规则
 
 每次编码都必须满足以下要求：

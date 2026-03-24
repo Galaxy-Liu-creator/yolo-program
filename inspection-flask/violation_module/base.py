@@ -134,6 +134,8 @@ class BaseVio(metaclass=ABCMeta):
                                    settings.VIO_IMAGE_PATH,
                                    self.datetime_list[max_conf_each],
                                    rule_name=name)
+            self.plot_targets.clear()
+            return True
         self.plot_targets.clear()
         return None
     # def save(self, image, vio_name, targets=None):

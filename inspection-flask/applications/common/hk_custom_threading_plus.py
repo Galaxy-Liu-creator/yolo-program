@@ -5,8 +5,26 @@ import time
 import traceback
 from collections import deque
 
+import numpy as np
+
 import settings
 from violation_module.vio_workwear_missing import WorkwearMissingViolation
+
+
+def _make_white_bg_crop(frame: np.ndarray, bbox: list) -> np.ndarray:
+    """将帧中人员框外区域替换为白色后裁剪，对应原 YOLOv5 add_white_background 逻辑。
+
+    用于兼容在白底格式数据上训练的工服检测模型。
+    当 settings.USE_WHITE_BG_MASK=True 时使用，否则使用直接裁剪。
+    """
+    h, w = frame.shape[:2]
+    x1 = max(0, int(bbox[0]))
+    y1 = max(0, int(bbox[1]))
+    x2 = min(w, int(bbox[2]))
+    y2 = min(h, int(bbox[3]))
+    white = np.ones((h, w, 3), dtype=np.uint8) * 255
+    white[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+    return white[y1:y2, x1:x2]
 
 
 class HKCustomThread(threading.Thread):
@@ -16,7 +34,7 @@ class HKCustomThread(threading.Thread):
         self.app = app
         self._running = threading.Event()
         self._running.set()
-        self.window = deque(maxlen=settings.TEMPORAL_WINDOW_SIZE)
+        self.window = deque(maxlen=getattr(settings, "TEMPORAL_WINDOW_SIZE", 5))
         self.last_processed_ts = None
         self.last_alert_ts = None
 
@@ -24,6 +42,7 @@ class HKCustomThread(threading.Thread):
         self._running.clear()
 
     def fetch_frame(self):
+        """从全局缓存读取当前摄像头最新帧；若无新帧则返回 (None, None)。"""
         frame = self.app.config["hk_images"].get(self.camera.id)
         timestamp = self.app.config["hk_images_datetime"].get(self.camera.id)
         if frame is None or timestamp is None:
@@ -34,10 +53,11 @@ class HKCustomThread(threading.Thread):
         return frame.copy(), timestamp
 
     def detect_persons(self, frame):
+        """对整帧执行人员检测，返回检测器统一格式结果列表。"""
         detector = self.app.config["person_model"]
-        return detector.infer(frame, conf_threshold=settings.PERSON_CONF)
+        return detector.infer(frame, conf_threshold=getattr(settings, "PERSON_CONF", 0.55))
 
-    def _in_roi(self, bbox):
+    def _in_roi(self, bbox: list) -> bool:
         roi = getattr(self.camera, "roi", None)
         if not roi:
             return True
@@ -45,7 +65,8 @@ class HKCustomThread(threading.Thread):
         rx1, ry1, rx2, ry2 = roi
         return x1 >= rx1 and y1 >= ry1 and x2 <= rx2 and y2 <= ry2
 
-    def _crop_person(self, frame, bbox):
+    def _crop_person(self, frame: np.ndarray, bbox: list):
+        """直接裁剪人员框区域，返回裁剪图；坐标越界时做边界修正。"""
         x1, y1, x2, y2 = [int(v) for v in bbox]
         x1 = max(0, x1)
         y1 = max(0, y1)
@@ -55,25 +76,44 @@ class HKCustomThread(threading.Thread):
             return None
         return frame[y1:y2, x1:x2]
 
-    def build_person_contexts(self, frame, persons):
+    def build_person_contexts(self, frame: np.ndarray, persons: list) -> list[dict]:
+        """为每个有效人员构建包含工服检测结果的上下文字典。
+
+        由 settings.USE_WHITE_BG_MASK 决定裁剪方式：
+          False（默认）：直接裁剪人员框
+          True：先将框外区域替换为白色再裁剪（兼容白底训练数据）
+        """
         workwear_detector = self.app.config["workwear_model"]
-        contexts = []
+        min_area = getattr(settings, "MIN_PERSON_BOX_AREA", 3000)
+        workwear_conf = getattr(settings, "WORKWEAR_CONF", 0.45)
+        use_white_bg = getattr(settings, "USE_WHITE_BG_MASK", False)
+
+        contexts: list[dict] = []
         for person in persons:
             bbox = person.get("bbox", [])
             if len(bbox) != 4:
                 continue
             x1, y1, x2, y2 = bbox
             area = max(0, x2 - x1) * max(0, y2 - y1)
-            if area < settings.MIN_PERSON_BOX_AREA:
+            if area < min_area:
                 continue
 
-            crop = self._crop_person(frame, bbox)
-            workwear_items = []
-            if crop is not None:
+            if use_white_bg:
+                crop = _make_white_bg_crop(frame, bbox)
+            else:
+                crop = self._crop_person(frame, bbox)
+
+            workwear_items: list[dict] = []
+            if crop is not None and crop.size > 0:
                 workwear_items = workwear_detector.infer(
                     crop,
-                    conf_threshold=settings.WORKWEAR_CONF,
+                    conf_threshold=workwear_conf,
                 )
+
+            workwear_labels = getattr(settings, "WORKWEAR_LABELS", [])
+            has_workwear = any(
+                item.get("label") in workwear_labels for item in workwear_items
+            )
 
             contexts.append(
                 {
@@ -83,15 +123,17 @@ class HKCustomThread(threading.Thread):
                     "area": area,
                     "in_roi": self._in_roi(bbox),
                     "workwear_items": workwear_items,
-                    "has_workwear": bool(workwear_items),
+                    "has_workwear": has_workwear,
                 }
             )
         return contexts
 
-    def run_rule_engine(self):
-        """对当前时间窗口内的帧批次执行工服违规规则判定。
-        返回违规事件记录字典（由 WorkwearMissingViolation.run() 内部完成图片保存），
-        若未触发则返回 None。"""
+    def run_rule_engine(self) -> bool | None:
+        """对当前时间窗口执行工服违规规则判定。
+
+        WorkwearMissingViolation.run() 内部完成证据图保存与数据库写入。
+        触发违规时返回 True；窗口未达阈值或无有效人员时返回 None。
+        """
         violation = WorkwearMissingViolation()
         frames = [item["frame"] for item in self.window]
         datetime_list = [item["timestamp"] for item in self.window]
@@ -109,24 +151,20 @@ class HKCustomThread(threading.Thread):
         )
         return violation.run()
 
-    def _alert_suppressed(self, timestamp):
-        """判断当前时刻是否在告警抑制窗口内，避免同一摄像头短时间重复报警。"""
+    def _alert_suppressed(self, timestamp) -> bool:
+        """判断当前时刻是否仍处于告警抑制窗口内，避免同一摄像头短时间重复报警。"""
         if self.last_alert_ts is None:
             return False
         suppression = getattr(settings, "alert_suppression_seconds", 300)
         return (timestamp - self.last_alert_ts).total_seconds() < suppression
 
-    def emit_event(self, event):
-        """将违规事件写入全局队列并记录日志。event 为 save_violate_photo 返回的记录字典。"""
-        if not isinstance(event, dict):
+    def emit_event(self, triggered):
+        """违规触发后记录日志。triggered 为 True（saving 已由 violation.run() 完成）。"""
+        if not triggered:
             return
-        self.app.config["violation_events"].append(event)
         self.app.logger.warning(
-            "camera %s 触发违规 [%s] 于 %s，证据图: %s",
+            "camera %s 触发工服未穿戴违规告警，证据图已保存",
             self.camera.id,
-            event.get("rule_name") or event.get("rule_code", "unknown"),
-            event.get("position_time", ""),
-            event.get("href", ""),
         )
 
     def run(self):
@@ -165,12 +203,14 @@ class HKCustomThread(threading.Thread):
                     time.sleep(round_sleep)
                     continue
 
-                event = self.run_rule_engine()
-                if event:
+                triggered = self.run_rule_engine()
+                if triggered:
                     self.last_alert_ts = timestamp
-                    self.emit_event(event)
+                    self.emit_event(triggered)
+
                 time.sleep(round_sleep)
-            except Exception as exc:  # pragma: no cover - 依赖运行环境
+
+            except Exception as exc:  # pragma: no cover
                 trace = traceback.format_exc()
                 self.app.logger.error(
                     "camera %s 检测循环异常: %s\n%s", self.camera.id, exc, trace
@@ -183,13 +223,13 @@ class HKCustomThread(threading.Thread):
 class ThreadManager:
     def __init__(self, app=None):
         self.app = app
-        self.threads = {}
+        self.threads: dict[str, HKCustomThread] = {}
         self._lock = threading.Lock()
 
     def bind_app(self, app):
         self.app = app
 
-    def add_thread(self, camera):
+    def add_thread(self, camera) -> bool:
         if self.app is None:
             return False
 
@@ -204,7 +244,7 @@ class ThreadManager:
             new_thread.start()
             return True
 
-    def stop_thread(self, camera_id):
+    def stop_thread(self, camera_id) -> bool:
         camera_id = str(camera_id)
         with self._lock:
             thread = self.threads.pop(camera_id, None)
@@ -220,18 +260,27 @@ class ThreadManager:
         for camera_id in camera_ids:
             self.stop_thread(camera_id)
         if app is not None:
-            app.logger.warning("all detect threads stopped")
+            app.logger.warning("所有工服检测线程已停止")
 
     def restart_all_threads(self, app=None):
-        """重启所有启用摄像头的检测线程。错峰启动，避免同时加载模型造成资源竞争。"""
+        """重启所有启用摄像头的检测线程。
+
+        直接查询数据库获取当前启用的摄像头列表，与 camera_registry 缓存解耦，
+        确保重启时能反映最新的摄像头启用状态。错峰启动避免资源竞争。
+        """
         app = app or self.app
         if app is None:
             return
 
         self.stop_all_threads(app)
-        for camera in app.config["camera_registry"].values():
-            if int(camera.enable) != 1:
-                continue
-            if self.add_thread(camera):
-                app.logger.info("重启工服检测线程 camera %s", camera.id)
-                time.sleep(0.2)  # 错峰启动，避免多摄像头同时初始化占满资源
+
+        from applications.models import HKCamera
+
+        with app.app_context():
+            cameras = HKCamera.query.filter_by(is_delete=0, enable=1).all()
+            for camera in cameras:
+                if self.add_thread(camera):
+                    app.logger.info("重启工服检测线程 camera %s", camera.id)
+                    time.sleep(0.2)
+                else:
+                    app.logger.warning("工服检测线程 camera %s 重启失败或已在运行", camera.id)

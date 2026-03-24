@@ -36,6 +36,12 @@ WORKWEAR_CONF = 0.45   # 工服检测置信度阈值
 # 合规工服类别列表（模型输出的 label 名称，命中任一即视为穿戴合规）
 WORKWEAR_LABELS = ["work_clothes", "reflective_vest", "protective_suit", "uniform_top"]
 
+# 工服检测前的人员区域预处理方式
+# True：将帧中人员框外区域替换为白色后裁剪（对应原 YOLOv5 add_white_background 逻辑，
+#       兼容在白底格式数据上训练的工服模型）
+# False：直接裁剪人员框区域（推荐默认，适用于在真实场景数据上训练的 YOLOv11 模型）
+USE_WHITE_BG_MASK = False
+
 # 人员框最小面积（像素²），小于此值的人员目标视为过远/过小，跳过检测
 MIN_PERSON_BOX_AREA = 3000
 
