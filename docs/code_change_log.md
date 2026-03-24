@@ -1,7 +1,64 @@
 # 代码修改记录
 
+## 第一阶段初步工作总结与下一阶段预期工作
+
+### 第一阶段初步工作总结
+
+- 已完成 `inspection-flask/violation_module/vio_zsmjwcjf.py` 与 `inspection-flask/violation_module/vio_workwear_missing.py` 的职责合并。
+- 现在正式的未穿工服规则实现位于 `inspection-flask/violation_module/vio_workwear_missing.py`，旧文件 `vio_zsmjwcjf.py` 仅保留兼容导出，避免历史命名继续承载业务逻辑。
+- 规则判定已从“未穿警服”的遗留语义切换为“未穿工服”，并对齐当前 YOLOv11 双模型链路的数据结构：上游输入为 `persons -> workwear_items`，规则输出继续复用 `BaseVio.save()` 的抓拍落库流程。
+- 本轮同时收紧了规则判定口径：空的 `WORKWEAR_LABELS` 不再直接放大误报；时间窗比例改为“违规帧数 / 有效人员帧数”，避免无人帧、无效框帧冲淡触发比例；绘图缓存不再重复添加两次相同的人框。
+
+### 当前代码逻辑是否足够严谨
+
+结论：当前代码已经可以“初步实现”基于 YOLOv11 的加油站工人未穿工服检测，但距离可稳定上线还有明显差距。
+
+- 可以初步实现的前提：
+  - `person_model` 能稳定输出 `person` 框。
+  - `workwear_model` 能在人体裁剪图上输出 `workwear_items`，且标签命名与 `WORKWEAR_LABELS` 保持一致。
+  - 海康线程链路能把 `frame / timestamp / persons` 正常压入时间窗，并调用 `WorkwearMissingViolation.run()`。
+- 目前仍不够严谨的点：
+  - `applications/__init__.py` 的核心模型装配在审查文档中已被指出存在被整体注释的风险，如果启动期没有恢复装配，当前检测链路无法真正跑通。
+  - `HKCustomThread` 的时间窗仍是“按摄像头帧级”而不是“按人员轨迹级”聚合，无法区分同一窗口内不同工人的连续性，容易把多人交替出现误当作同一违规事件。
+  - `build_person_contexts()` 对“未穿工服”的判断完全依赖二阶段工服模型的负样本结果，缺少遮挡、背身、半身入镜、小目标等低质量样本的兜底策略，漏检时会被直接判成违规。
+  - ROI 判断目前要求整个人框完整落入 ROI，边缘人员会被直接排除，业务上可能偏严。
+  - 告警抑制是摄像头级而不是人员级，多个工人连续违规时可能被同一个 `alert_suppression_seconds` 窗口吞掉。
+  - 目前缺少针对 `vio_workwear_missing.py` 的单元测试与回归样例，边界输入只能靠人工审查保证。
+
+### 下一阶段预期工作
+
+- 第一优先级：恢复并统一 `applications/__init__.py` 的模型装配，明确 YOLOv11 人检模型、工服模型、线程管理器和缓存容器的正式初始化入口，先解决“代码存在但启动链不闭环”的问题。
+- 第二优先级：把 `utils/models.py`、`hk_custom_threading_plus.py`、`logic_judge.py` 的 YOLOv11 适配层再抽象一层，统一成稳定的 `person_context` 协议，避免业务规则继续感知底层模型细节。
+- 第三优先级：把当前摄像头级时间窗升级为“人员级时序判定”，至少补上目标跟踪或轻量 ID 关联，降低多人场景下的误触发与误抑制。
+- 第四优先级：补齐样例测试与可视化调试能力，包括典型正样本、遮挡负样本、ROI 边缘样本、小目标样本，以及抓拍图与裁剪图联动排查工具。
+- 第五优先级：评估是否要把“未穿工服”扩展为更完整的 PPE 规则引擎，把工服、反光背心、安全帽等统一纳入可配置规则，而不是继续靠单一 `WORKWEAR_LABELS` 列表硬编码。
+
 本文档记录每次代码改动的详细内容，按时间倒序排列。  
 每次修改代码后必须同步更新本文档，确保每一步改了什么都有据可查。
+
+---
+
+## 2026-03-24 Section 6 合并未穿工服规则模块并修正判定口径
+
+### 1. `inspection-flask/violation_module/vio_workwear_missing.py` 
+
+- 由原先的单行转发文件改为正式规则实现文件。
+- 新建 `WorkwearMissingViolation(BaseVio)`，作为未穿工服场景的唯一主实现。
+- `run()` 的时间窗判定从“违规帧数 / 窗口总帧数”调整为“违规帧数 / 有效人员帧数”，避免无人帧和无效框稀释违规比例。
+- 新增 `_extract_persons()`、`_load_workwear_labels()`、`_load_min_person_area()`、`_load_trigger_ratio()`、`_is_valid_person()`、`_has_compliant_workwear()` 等辅助方法，收紧输入校验和配置容错。
+- 当 `WORKWEAR_LABELS` 为空或时间窗内没有任何有效人员时，直接返回 `None` 并清空 `plot_targets`，避免配置错误导致整窗误报。
+- `_add_person_to_plot()` 改为只缓存一份人体框，去掉原先重复追加两次相同人框的绘图冗余。
+
+### 2. `inspection-flask/violation_module/vio_zsmjwcjf.py` 
+
+- 改为兼容入口文件：仅从 `vio_workwear_missing.py` 重新导出 `WorkwearMissingViolation`。
+- 这样可以兼容历史导入路径，同时把正式业务语义收敛到“未穿工服”而不是继续挂在旧的“未穿警服”文件名下。
+
+### 3. 逻辑层面的直接结论
+
+- 现在 `inspection-flask/applications/common/hk_custom_threading_plus.py -> violation_module/vio_workwear_missing.py -> violation_module/base.py` 的链路在规则层已经完成从旧警服语义向工服语义的切换。
+- 只要上游模型初始化和 `person_context` 构造链路可用，当前代码可以初步支撑 YOLOv11 的“人检 + 工服二阶段检测 + 时间窗告警”闭环。
+- 但它仍然只是第一阶段版本，后续还需要补强启动装配、目标跟踪、低质量样本兜底和测试样例。
 
 ---
 
@@ -67,7 +124,7 @@
 
 ---
 
-### 3. `inspection-flask/violation_module/vio_zsmjwcjf.py`
+### 3. `inspection-flask/violation_module/vio_zsmjwcjf.py` > 注：此次分工后续在Section 6中调整
 
 **改动类型**：完全重写
 
@@ -86,7 +143,7 @@
 
 ---
 
-### 4. 新建 `inspection-flask/violation_module/vio_workwear_missing.py`
+### 4. 新建 `inspection-flask/violation_module/vio_workwear_missing.py` > 注：此次分工后续在Section 6中调整
 
 **改动类型**：新增文件
 
