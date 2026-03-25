@@ -81,8 +81,7 @@ def create_app():
     hk_thread_manager.bind_app(app)
     app.config['hk_threadManager'] = hk_thread_manager
 
-    app.config['hk_images']          = {}   # 摄像头最新帧缓存 {camera_id: ndarray}
-    app.config['hk_images_datetime'] = {}   # 对应抓图时间戳   {camera_id: datetime}
+    app.config['hk_frame_cache']     = {}   # 摄像头最新帧缓存 {camera_id: {"frame": ndarray, "ts": datetime}}
 
     hk_recorder = HKRecorderThreadManager()
     hk_recorder.bind_app(app)

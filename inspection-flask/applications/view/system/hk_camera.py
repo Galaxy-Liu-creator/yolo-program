@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import os
 import threading
 import time
+from types import SimpleNamespace
 
 import cv2
 from flask import Blueprint, request, render_template, jsonify, current_app, Response
@@ -40,62 +41,34 @@ def index():
 @bp.get('/data')
 @authorize("system:camera:main")
 def table():
-    # 部门id
     stationId = request.args.get('stationId', type=int)
-    # 分局id
     parentId = request.args.get('parentId', type=int)
-    sort_field = request.args.get('sort', 'id')  # 排序字段，默认按照id排序
-    sort_order = request.args.get('order', 'asc')  # 排序方式，默认升序
-    filters = [HKCamera.is_delete == 0]
-    if stationId:
-        if stationId:
-            if stationId in dept_auth():
-                filters.append(HKCamera.dept_id == stationId)
-        # filters.append(Camera.dept_id == stationId)
-        cameras = HKCamera.query.filter(*filters)
-    elif parentId:
-        # filters.append(Camera.sub_id == parentId)
-        if parentId in sub_auth():
-            print("sub_id",parentId)
-            print("dept_id",dept_auth())
-            filters.append(HKCamera.sub_id == parentId)
-            filters.append(HKCamera.dept_id.in_(dept_auth()))
-        cameras = HKCamera.query.filter(*filters)
-        # cameras = Camera.query.filter(*filters)
-        # station_ids = Station.query.filter(Station.is_delete == 0, Station.parent_id == parentId).with_entities(
-        #     Station.id).all()
-        # station_ids = [id for (id,) in station_ids]  # 将查询结果的元组转换为列表
-        # # print("ids", station_ids)
-        # # 使用 or_ 进行多条件查询
-        # if station_ids:
-        #     station_unit_ids = Station.query.filter(Station.is_delete == 0,
-        #                                             Station.parent_id.in_(station_ids)).with_entities(
-        #         Station.id).all()
-        #     station_unit_ids = [id_[0] for id_ in station_unit_ids]
-        #     if station_unit_ids:
-        #         cameras = Camera.query.filter(Camera.station_id.in_(station_unit_ids), *filters)
-        #     else:
-        #         cameras = Camera.query.filter(*filters)
-        # else:
-        #     cameras = Camera.query.filter(*filters)
-    else:
-        filters.append(HKCamera.dept_id.in_(dept_auth()))
-        cameras = HKCamera.query.filter(*filters)
-    # 根据传入的排序字段和排序方式进行排序
-    if sort_order == 'desc':
-        cameras = cameras.order_by(desc(getattr(HKCamera, sort_field)))
-    else:
-        cameras = cameras.order_by(asc(getattr(HKCamera, sort_field)))
-    # 执行分页
-    cameras = cameras.layui_paginate()
-    # if role_name:
-    #     filters.append(Role.name.contains(role_name))
-    # if role_code:
-    #     filters.append(Role.code.contains(role_code))
+    sort_field = request.args.get('sort', 'id')
+    sort_order = request.args.get('order', 'asc')
 
-    #   .order_by(station_alias.id)\
-    # station_parent = Station.query.filter(Station.is_delete == 0, Station.type == 2)
-    # station_dict = {station.id: station.dept_name for station in station_parent}
+    _SORT_WHITELIST = {"id", "name", "ip", "enable", "create_time", "update_time", "type", "port"}
+    if sort_field not in _SORT_WHITELIST:
+        sort_field = "id"
+
+    filters = [HKCamera.is_delete == 0]
+    authorized_depts = dept_auth()
+
+    if stationId:
+        if stationId not in authorized_depts:
+            return table_api(data=[], count=0)
+        filters.append(HKCamera.dept_id == stationId)
+    elif parentId:
+        if parentId not in sub_auth():
+            return table_api(data=[], count=0)
+        filters.append(HKCamera.sub_id == parentId)
+        filters.append(HKCamera.dept_id.in_(authorized_depts))
+    else:
+        filters.append(HKCamera.dept_id.in_(authorized_depts))
+
+    cameras = HKCamera.query.filter(*filters)
+    order_col = getattr(HKCamera, sort_field, HKCamera.id)
+    cameras = cameras.order_by(desc(order_col) if sort_order == 'desc' else asc(order_col))
+    cameras = cameras.layui_paginate()
     return table_api(data=HkCameraOutSchema(many=True).dump(cameras), count=cameras.total)
 
 
@@ -201,6 +174,28 @@ def add():
     return render_template('system/hk_camera/add.html')
 
 
+def _validate_camera_params(ip, port, channel):
+    """校验摄像头关键参数，返回 (ok, error_msg)。"""
+    import re
+    if ip and not re.match(r'^\d{1,3}(\.\d{1,3}){3}$', ip):
+        return False, "IP 地址格式不合法"
+    if port is not None:
+        try:
+            p = int(port)
+            if not (1 <= p <= 65535):
+                return False, "端口号范围应为 1-65535"
+        except (TypeError, ValueError):
+            return False, "端口号必须为整数"
+    if channel is not None:
+        try:
+            c = int(channel)
+            if c < 1:
+                return False, "通道号必须为正整数"
+        except (TypeError, ValueError):
+            return False, "通道号必须为正整数"
+    return True, ""
+
+
 @bp.post('/save')
 @authorize("system:camera:add", log=True)
 def save():
@@ -208,19 +203,23 @@ def save():
     username = str_escape(req_json.get("userName"))
     password = str_escape(req_json.get("passWord"))
     ip = str_escape(req_json.get("location"))
-    # url = "rtsp://" + username + ":" + str(password) + "@" + ip + ":554"
-    # url = url.strip()
+    port = str_escape(req_json.get('port'))
+    channel = str_escape(req_json.get("channel"))
+
+    ok, err = _validate_camera_params(ip, port, channel)
+    if not ok:
+        return fail_api(msg=err)
+
     camera = HKCamera(
         name=str_escape(req_json.get("cameraName")),
-        # station_id=str_escape(req_json.get("areaId")),
         dept_id=str_escape(req_json.get("stationId")),
         sub_id=str_escape(req_json.get("parentId")),
         username=username,
         password=password,
         ip=ip,
-        port=str_escape(req_json.get('port')),
+        port=port,
         type=str_escape(req_json.get("cameraType")),
-        channel=str_escape(req_json.get("channel")),
+        channel=channel,
     )
     db.session.add(camera)
     db.session.commit()
@@ -236,6 +235,12 @@ def update():
     username = str_escape(req_json.get("userName"))
     password = str_escape(req_json.get("passWord"))
     ip = str_escape(req_json.get("location"))
+    port = str_escape(req_json.get('port'))
+    channel = str_escape(req_json.get('channel'))
+
+    ok, err = _validate_camera_params(ip, port, channel)
+    if not ok:
+        return fail_api(msg=err)
 
     data = {
         "name": str_escape(req_json.get("cameraName")),
@@ -243,10 +248,10 @@ def update():
         "password": password,
         "ip": ip,
         "type": str_escape(req_json.get("cameraType")),
-        "port": str_escape(req_json.get('port')),
+        "port": port,
         "dept_id": str_escape(req_json.get('stationId')),
         "sub_id": str_escape(req_json.get('parentId')),
-        "channel": str_escape(req_json.get('channel')),
+        "channel": channel,
     }
     camera = HKCamera.query.filter_by(id=id).update(data)
     db.session.commit()
@@ -266,7 +271,7 @@ def remove(id):
     return success_api(msg="删除成功")
 
 
-@bp.get('/add_dept')
+@bp.post('/add_dept')
 @authorize("system:camera:main", log=True)
 def add_dept():
     # 把所有的区查询出来
@@ -298,7 +303,7 @@ def add_dept():
     return ""
 
 
-@bp.get('/add_room')
+@bp.post('/add_room')
 @authorize("system:camera:main", log=True)
 def add_room():
     # 把所有的区查询出来
@@ -341,70 +346,65 @@ def add_room():
 @authorize("system:camera:edit", log=True)
 def enable():
     id = request.get_json(force=True).get('cameraId')
-    if id:
-        res = enable_status(HKCamera, id)
+    if not id:
+        return fail_api(msg="数据错误")
 
-        if not res:
-            return fail_api(msg="出错啦")
-        # 启动多线程
-        camera_instance = curd.get_one_by_id(HKCamera, id)
-        station = Station(
-            id=camera_instance.station.id,
-            dept_name=camera_instance.station.dept_name,
-            leader=camera_instance.station.leader,
-            phone=camera_instance.station.phone,
-            is_delete=camera_instance.station.is_delete,
-            type=camera_instance.station.type,
-            remark=camera_instance.station.remark,
-            address=camera_instance.station.address,
-            create_at=camera_instance.station.create_at,
-            update_at=camera_instance.station.update_at,
-            # update_at=camera_instance.station.update_at,
-            parent_id=camera_instance.station.parent_id
-        )
-        camera_info = HKCamera(
-            id=camera_instance.id,
-            name=camera_instance.name,
-            ip=camera_instance.ip,
-            port=camera_instance.port,
-            username=camera_instance.username,
-            password=camera_instance.password,
-            enable=camera_instance.enable,
-            type=camera_instance.type,
-            is_delete=camera_instance.is_delete,
-            station_id=camera_instance.station_id,
-            create_time=camera_instance.create_time,
-            update_time=camera_instance.update_time,
-            station=station,
-            sub_id=camera_instance.sub_id,
-            dept_id=camera_instance.dept_id,
-            channel=camera_instance.channel
-        )
-        started = current_app.config['hk_threadManager'].add_thread(camera_info)
-        if not started:
-            init_error = current_app.config.get("detection_model_init_error") or "检测模型未就绪"
-            current_app.logger.error("工服检测线程 camera %s 启动失败: %s", id, init_error)
-            return fail_api(msg=f"启动失败：{init_error}")
-        # add_new_detect(camera)
-        # add_new_detect(camera.id, camera.camera_url, camera.station_id, camera.camera_type)
-        return success_api(msg="启动成功")
-    return fail_api(msg="数据错误")
+    res = enable_status(HKCamera, id)
+    if not res:
+        return fail_api(msg="出错啦")
+
+    camera_instance = curd.get_one_by_id(HKCamera, id)
+    if camera_instance is None:
+        disable_status(HKCamera, id)
+        return fail_api(msg="摄像头不存在")
+
+    camera_info = SimpleNamespace(
+        id=camera_instance.id,
+        name=getattr(camera_instance, "name", None),
+        ip=getattr(camera_instance, "ip", None),
+        port=getattr(camera_instance, "port", None),
+        username=getattr(camera_instance, "username", None),
+        password=getattr(camera_instance, "password", None),
+        channel=getattr(camera_instance, "channel", None),
+        type=getattr(camera_instance, "type", None),
+        enable=camera_instance.enable,
+        is_delete=camera_instance.is_delete,
+        station_id=getattr(camera_instance, "station_id", None),
+        dept_id=getattr(camera_instance, "dept_id", None),
+        sub_id=getattr(camera_instance, "sub_id", None),
+        roi=getattr(camera_instance, "roi", None),
+        frame_path=getattr(camera_instance, "frame_path", None),
+    )
+
+    started = current_app.config['hk_threadManager'].add_thread(camera_info)
+    if not started:
+        disable_status(HKCamera, id)
+        init_error = current_app.config.get("detection_model_init_error") or "检测模型未就绪"
+        current_app.logger.error("工服检测线程 camera %s 启动失败: %s", id, init_error)
+        return fail_api(msg=f"启动失败：{init_error}")
+    return success_api(msg="启动成功")
 
 
 @bp.put('/disable')
 @authorize("system:camera:edit", log=True)
 def dis_enable():
     _id = request.get_json(force=True).get('cameraId')
-    if _id:
-        res = disable_status(HKCamera, _id)
-        if not res:
-            return fail_api(msg="出错啦")
-        if current_app.config['hk_threadManager'].stop_thread(_id):
-            current_app.logger.info(f"工服检测线程 camera {_id} 已关闭")
-        else:
-            current_app.logger.warning(f"工服检测线程 camera {_id} 关闭失败")
-        return success_api(msg="禁用成功")
-    return fail_api(msg="数据错误")
+    if not _id:
+        return fail_api(msg="数据错误")
+
+    thread_stopped = current_app.config['hk_threadManager'].stop_thread(_id)
+    if thread_stopped:
+        current_app.logger.info("工服检测线程 camera %s 已关闭", _id)
+    else:
+        current_app.logger.warning("工服检测线程 camera %s 关闭失败或不存在", _id)
+
+    res = disable_status(HKCamera, _id)
+    if not res:
+        return fail_api(msg="数据库状态更新失败")
+
+    if not thread_stopped:
+        return success_api(msg="已禁用（线程可能未完全退出，将在下次重启时清理）")
+    return success_api(msg="禁用成功")
 
 
 @bp.get('/violations')
@@ -418,7 +418,8 @@ def violations():
     """
     camera_id = request.args.get('camera_id', type=int)
     limit = min(request.args.get('limit', 100, type=int), 500)
-    filters = [ViolatePhoto.is_delete == 0]
+    authorized_depts = dept_auth()
+    filters = [ViolatePhoto.is_delete == 0, ViolatePhoto.dept_id.in_(authorized_depts)]
     if camera_id:
         filters.append(ViolatePhoto.camera_id == camera_id)
     records = ViolatePhoto.query.filter(*filters).order_by(
@@ -447,10 +448,16 @@ def violations():
 def violations_by_camera(camera_id):
     """
     按摄像头 ID 查询该摄像头的违规记录，最多返回最新 200 条。
+    校验 camera_id 归属当前用户权限范围。
     """
+    authorized_depts = dept_auth()
+    camera = HKCamera.query.filter_by(id=camera_id, is_delete=0).first()
+    if camera is None or camera.dept_id not in authorized_depts:
+        return jsonify({"code": 0, "camera_id": camera_id, "count": 0, "data": []})
     records = ViolatePhoto.query.filter(
         ViolatePhoto.camera_id == camera_id,
-        ViolatePhoto.is_delete == 0
+        ViolatePhoto.is_delete == 0,
+        ViolatePhoto.dept_id.in_(authorized_depts),
     ).order_by(desc(ViolatePhoto.position_time)).limit(200).all()
     data = [
         {
@@ -542,13 +549,22 @@ def _extract_rule_meta(row):
     return resolved_id, _normalize_rule_value(resolved_code), _normalize_rule_value(resolved_name)
 
 
+_RULE_CACHE_TTL_SECONDS = 300
+
+
 def _resolve_violate_rule(rule_value, rule_name=None):
     normalized_value = _normalize_rule_value(rule_value)
     normalized_name = _normalize_rule_value(rule_name)
     cache_key = (normalized_value, normalized_name)
-    cache = current_app.config.setdefault("violate_rule_resolution_cache", {})
-    if cache_key in cache:
-        return cache[cache_key]
+    cache_store = current_app.config.setdefault("violate_rule_resolution_cache", {})
+    cache_ts = current_app.config.setdefault("violate_rule_cache_ts", {})
+
+    cached_time = cache_ts.get(cache_key)
+    if cached_time is not None and cache_key in cache_store:
+        if (time.time() - cached_time) < _RULE_CACHE_TTL_SECONDS:
+            return cache_store[cache_key]
+        cache_store.pop(cache_key, None)
+        cache_ts.pop(cache_key, None)
 
     resolved_id = _coerce_rule_id(normalized_value)
     resolved_code = normalized_value if resolved_id is None else None
@@ -596,14 +612,15 @@ def _resolve_violate_rule(rule_value, rule_name=None):
             resolved_id = configured_rule_id
 
     if resolved_name is None and resolved_code == _normalize_rule_value(getattr(settings, "WORKWEAR_VIOLATION_TYPE", None)):
-        resolved_name = "未穿工服"
+        resolved_name = getattr(settings, "WORKWEAR_VIOLATION_NAME", "未穿工服")
 
     if table_available and resolved_id is None:
         result = (None, resolved_code, resolved_name)
     else:
         result = (resolved_id, resolved_code, resolved_name)
 
-    cache[cache_key] = result
+    cache_store[cache_key] = result
+    cache_ts[cache_key] = time.time()
     return result
 
 
@@ -633,13 +650,10 @@ def save_violate_photo(rule_value, id, frame, station_id, dept_id, sub_id, path,
         rule_name=rule_name,
     )
     if resolved_rule_id is None:
-        current_app.logger.error(
-            "camera %s save violate photo aborted: unresolved violate rule value=%s rule_name=%s",
-            id,
-            rule_value,
-            rule_name,
+        current_app.logger.warning(
+            "camera %s violate_rule_id 未解析 (rule_value=%s rule_name=%s)，将以 rule_code 入库",
+            id, rule_value, rule_name,
         )
-        return None
 
     type = resolved_rule_id
     rule_name = resolved_rule_name or rule_name

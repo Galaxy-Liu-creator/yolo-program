@@ -7,7 +7,7 @@ class ViolatePhoto(db.Model):
     __tablename__ = 'admin_violate_photo'
 
     id           = db.Column(db.Integer, primary_key=True, autoincrement=True, comment='ID')
-    violate_id   = db.Column(db.Integer, db.ForeignKey("admin_violate_rule.id"), nullable=False, comment='违规类型ID')
+    violate_id   = db.Column(db.Integer, db.ForeignKey("admin_violate_rule.id"), nullable=True, comment='违规类型ID（可为空，以 rule_code 为主标识）')
     href         = db.Column(db.String(200), nullable=False, comment='证据图存储路径')
     station_id   = db.Column(db.Integer, nullable=True,  comment='监控站点ID')
     dept_id      = db.Column(db.Integer, db.ForeignKey("admin_police_station.id"), nullable=False, comment='所属单位ID')

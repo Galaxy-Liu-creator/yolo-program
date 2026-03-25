@@ -44,8 +44,7 @@ def get_img(cameras, app):
         if image is None or image.size == 0:
             _FAIL_COUNTS[cid] = _FAIL_COUNTS.get(cid, 0) + 1
             fail_count = _FAIL_COUNTS[cid]
-            app.config["hk_images"].pop(cid, None)
-            app.config["hk_images_datetime"].pop(cid, None)
+            app.config["hk_frame_cache"].pop(cid, None)
             if fail_count == 1 or fail_count % _FAIL_WARN_THRESHOLD == 0:
                 app.logger.warning(
                     "camera %s 连续第 %d 次抓图失败，请检查设备连接或 frame_path 配置",
@@ -54,14 +53,11 @@ def get_img(cameras, app):
                 )
             continue
 
-        # 抓图成功，重置失败计数
         if _FAIL_COUNTS.get(cid, 0) > 0:
             app.logger.info("camera %s 抓图恢复正常", cid)
         _FAIL_COUNTS[cid] = 0
 
-        # 写入缓存：每个摄像头只保留最新帧
-        app.config["hk_images"][cid] = image
-        app.config["hk_images_datetime"][cid] = datetime.now()
+        app.config["hk_frame_cache"][cid] = {"frame": image, "ts": datetime.now()}
 
 
 class HKRecorderThread(threading.Thread):
@@ -107,8 +103,7 @@ class HKRecorderThreadManager:
             cache_key = camera_id
         _FAIL_COUNTS.pop(cache_key, None)
         if self.app is not None:
-            self.app.config.get("hk_images", {}).pop(cache_key, None)
-            self.app.config.get("hk_images_datetime", {}).pop(cache_key, None)
+            self.app.config.get("hk_frame_cache", {}).pop(cache_key, None)
 
     def list_cameras(self):
         with self._lock:

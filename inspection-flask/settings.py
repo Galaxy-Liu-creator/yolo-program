@@ -45,8 +45,9 @@ USE_WHITE_BG_MASK = False
 # 人员框最小面积（像素²），小于此值的人员目标视为过远/过小，跳过检测
 MIN_PERSON_BOX_AREA = 3000
 
-# 违规规则编码（写入数据库 rule_code 字段）
+# 违规规则编码与名称（写入数据库 rule_code / rule_name 字段）
 WORKWEAR_VIOLATION_TYPE = "workwear_missing"
+WORKWEAR_VIOLATION_NAME = "未穿工服"
 WORKWEAR_VIOLATION_ID = None
 
 # ─── 时序稳定性配置 ────────────────────────────────────────────────────────────
@@ -66,9 +67,9 @@ DEFAULT_CAMERA_PORT    = 8000
 DEFAULT_CAMERA_CHANNEL = 1
 
 # ─── 海康日志路径 ──────────────────────────────────────────────────────────────
-LOG_PATH = BASE_DIR.joinpath("logs")
-LOG_PATH.mkdir(exist_ok=True, parents=True)
-LOG_PATH = BASE_DIR.joinpath("logs", str(datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))).with_suffix(".log")
+LOG_DIR = BASE_DIR.joinpath("logs")
+LOG_DIR.mkdir(exist_ok=True, parents=True)
+LOG_FILE = LOG_DIR / (datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S") + ".log")
 
 VIDEO_CRT         = 1  # 视频帧数
 VIDEO_CRT_SECONDS = 1  # 一次处理单位秒

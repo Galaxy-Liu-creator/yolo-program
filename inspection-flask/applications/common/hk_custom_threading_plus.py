@@ -44,8 +44,11 @@ class HKCustomThread(threading.Thread):
 
     def fetch_frame(self):
         """从全局缓存读取当前摄像头最新帧；若无新帧则返回 (None, None)。"""
-        frame = self.app.config["hk_images"].get(self.camera.id)
-        timestamp = self.app.config["hk_images_datetime"].get(self.camera.id)
+        entry = self.app.config["hk_frame_cache"].get(self.camera.id)
+        if entry is None:
+            return None, None
+        frame = entry.get("frame")
+        timestamp = entry.get("ts")
         if frame is None or timestamp is None:
             return None, None
         if timestamp == self.last_processed_ts:
@@ -227,6 +230,7 @@ class HKCustomThread(threading.Thread):
                         continue
 
                     if self._alert_suppressed(timestamp):
+                        self.window.clear()
                         time.sleep(round_sleep)
                         continue
 
@@ -274,10 +278,9 @@ class ThreadManager:
 
         camera_id = str(camera.id)
         with self._lock:
-            thread = self.threads.get(camera_id)
-            if thread is not None and thread.is_alive():
+            existing = self.threads.get(camera_id)
+            if existing is not None and existing.is_alive():
                 return False
-
             new_thread = HKCustomThread(camera, self.app)
             self.threads[camera_id] = new_thread
             new_thread.start()
@@ -286,14 +289,18 @@ class ThreadManager:
     def stop_thread(self, camera_id) -> bool:
         camera_id = str(camera_id)
         with self._lock:
-            thread = self.threads.pop(camera_id, None)
+            thread = self.threads.get(camera_id)
         if thread is None:
             return False
         thread.stop()
-        thread.join(timeout=1.0)
-        if thread.is_alive() and self.app is not None:
-            self.app.logger.warning("camera %s 检测线程未在超时时间内退出", camera_id)
-        return True
+        thread.join(timeout=3.0)
+        with self._lock:
+            if not thread.is_alive():
+                self.threads.pop(camera_id, None)
+                return True
+            if self.app is not None:
+                self.app.logger.warning("camera %s 检测线程未在超时时间内退出，保留跟踪", camera_id)
+            return False
 
     def stop_all_threads(self, app=None):
         app = app or self.app

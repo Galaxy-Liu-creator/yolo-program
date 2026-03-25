@@ -1,5 +1,158 @@
 # 代码修改记录
 
+## 2026-03-25 重写 main.py 为 YOLOv11 工服检测独立诊断工具
+
+### 改动背景
+
+原 `main.py` 包含 109 行 YOLOv5 时代遗留代码：旧式 import（`hk.hksdk.device`、`utils.models.get_all_models`、`utils.pose`、`utils.torch_utils`）、`select_best_pose()` 姿态估计函数、`get_stream()`/`get_img()` 原始海康 SDK 测试函数、硬编码 IP 凭据、`test_class` 等测试构件。这些代码与当前 YOLOv11 工服检测系统完全不兼容，且 Flask 入口为 `app.py`，`main.py` 未在系统中承担任何角色。
+
+---
+
+### 1. `inspection-flask/main.py`
+
+**改动类型**：完全重写
+
+**改动内容**：
+
+- 删除所有 YOLOv5 遗留代码：`select_best_pose()`、`get_stream()`、`get_img()`、`md5_hash()`、`test_class`、`test()`、`__main__` 硬编码测试块
+- 删除所有旧 import：`hk.hksdk.device.HKStream`、`utils.models.get_all_models`/`seek_targets`、`utils.plots`、`utils.pose`、`utils.torch_utils`
+- 重写为 YOLOv11 工服检测管线独立诊断工具，支持两个子命令：
+  - `python main.py check`：验证推理设备、权重文件存在性、模型加载、预热推理耗时，以及 `settings.py` 中所有工服检测配置项的当前值
+  - `python main.py image <path> [-o <dir>]`：对单张图片或目录执行完整的"人员检测 → 人员裁剪 → 工服检测"管线，打印逐人结果（合规/违规、置信度、工服标签），并可选输出可视化标注图
+- `_build_person_contexts()` 复用与 `HKCustomThread.build_person_contexts` 相同的逻辑：`MIN_PERSON_BOX_AREA` 面积过滤、`USE_WHITE_BG_MASK` 预处理切换、`WORKWEAR_LABELS` 合规判定
+- `_draw_results()` 在帧上绘制人员框（合规绿色 / 违规红色）、工服子框（深绿色）及标签文字
+- 批量模式输出汇总统计：图片数、检测人数、合规/违规分布、平均耗时
+
+**改动原因**：原 `main.py` 是 YOLOv5 时代废弃的测试脚本，无法在新系统中使用。重写后的工具不依赖 Flask 上下文，可直接命令行运行，为部署前验证（权重是否就绪、推理是否通畅）和离线精度评估提供独立入口，填补了项目中"脱离服务测试检测链路"的能力空白。
+
+---
+
+## 2026-03-25 修正清单验证与全面改进
+
+基于 `docs/inspection-flask_修正清单.md` 的逐项验证，修复了清单中确认成立的 13 项问题以及额外发现的 5 项遗漏问题。修改涉及 6 个文件。
+
+### 1. `inspection-flask/applications/view/system/hk_camera.py`
+
+**改动类型**：安全修复 + 稳定性修复 + 接口健壮性增强
+
+**改动内容**：
+
+**M1 - `save_violate_photo()` 部署阻塞修复**：
+- 当 `resolved_rule_id` 为 None 时，不再以 `return None` 丢弃违规记录，改为降级 warning 并以 `rule_code` 为主标识继续入库
+
+**M2+M4 - `enable()` 重写**：
+- 移除手动构造脱离 session 的 `Station()`/`HKCamera()` ORM 实例，改用 `SimpleNamespace` 传递纯数据属性
+- 移除对 `camera_instance.station` 的直接访问（可能为 None），所有字段通过 `getattr` 安全读取
+- 线程启动失败时执行 `disable_status()` 回滚 DB 状态（P0-3 修复）
+
+**M3 - `dis_enable()` 原子性修复**：
+- 改为先停线程再更新 DB，确保用户看到的禁用状态与实际线程状态一致
+- 线程停止失败时返回带警告文案的成功响应而非盲目报成功
+
+**P0-1 - 摄像头列表权限修复**：
+- `stationId` 或 `parentId` 未通过 `dept_auth()`/`sub_auth()` 校验时直接返回空结果，不再退化为宽查询
+- 移除冗余的 `if stationId: if stationId:` 双重判断
+- 大量注释掉的旧 Camera 查询代码已清理
+
+**P0-2 - 违规记录权限修复**：
+- `/violations` 追加 `ViolatePhoto.dept_id.in_(dept_auth())` 过滤
+- `/violations/camera/<id>` 增加 `camera.dept_id` 归属校验
+
+**P1-1 - 排序字段白名单**：
+- 新增 `_SORT_WHITELIST` 集合，非法排序字段回退 `id`
+- `getattr(HKCamera, sort_field)` 改为 `getattr(HKCamera, sort_field, HKCamera.id)` 双重保护
+
+**P1-2 - GET 写库改 POST**：
+- `/add_dept` 和 `/add_room` 从 `@bp.get` 改为 `@bp.post`
+
+**P1-3 - 参数校验**：
+- 新增 `_validate_camera_params()` 辅助函数，校验 IP 格式（IPv4）、端口范围（1-65535）、通道号（正整数）
+- `save()` 和 `update()` 在入库前调用校验函数
+
+**P1-4 - 规则缓存 TTL**：
+- `_resolve_violate_rule()` 的缓存增加 300 秒 TTL，过期后自动清除
+- 变量名 `cache` 改为 `cache_store`/`cache_ts` 分别存储值和时间戳
+
+**P1-5 - rule_name 配置化**：
+- 回退值从硬编码 `"未穿工服"` 改为 `getattr(settings, "WORKWEAR_VIOLATION_NAME", "未穿工服")`
+
+**改动原因**：原代码存在多处权限越权、状态不一致、接口鲁棒性缺陷，直接影响检测系统的安全性和落地可行性。
+
+---
+
+### 2. `inspection-flask/applications/common/hk_custom_threading_plus.py`
+
+**改动类型**：线程安全修复 + 帧缓存原子化 + 窗口管理优化
+
+**改动内容**：
+
+**P0-4 - `stop_thread()` 竞争条件修复**：
+- 从"先 pop 再 join"改为"先 get+stop+join，确认退出后再 pop"
+- join 超时增加到 3 秒
+- 超时时保留字典跟踪，返回 False 阻止重复启动
+
+**P0-5 - 帧缓存读端原子化**：
+- `fetch_frame()` 改为从统一的 `hk_frame_cache` dict 读取 `{"frame": ndarray, "ts": datetime}` 结构
+
+**P1-6 - 抑制期间窗口清空**：
+- 进入告警抑制路径时 `self.window.clear()`，确保抑制结束后从零重新累积，避免语义不可解释的即刻重触发
+
+**改动原因**：线程先移除后 join 导致幽灵线程风险；分开读写两个 dict 存在理论竞态；抑制窗口行为清空后更可解释。
+
+---
+
+### 3. `inspection-flask/applications/common/hk_recorder_threading.py`
+
+**改动类型**：帧缓存写端原子化
+
+**改动内容**：
+
+- `get_img()` 中帧写入从两行分开赋值 `hk_images[cid]` + `hk_images_datetime[cid]` 合并为单行 `hk_frame_cache[cid] = {"frame": image, "ts": datetime.now()}`
+- 抓图失败时清理也改为操作 `hk_frame_cache`
+- `unregister_camera()` 的缓存清理改为操作 `hk_frame_cache`
+
+**改动原因**：与 P0-5 的读端原子化配套，消除帧与时间戳不一致的理论风险。
+
+---
+
+### 4. `inspection-flask/applications/__init__.py`
+
+**改动类型**：缓存初始化统一
+
+**改动内容**：
+
+- 移除 `app.config['hk_images']` 和 `app.config['hk_images_datetime']` 两个独立缓存
+- 新增 `app.config['hk_frame_cache'] = {}`，结构为 `{camera_id: {"frame": ndarray, "ts": datetime}}`
+
+**改动原因**：配合 P0-5 帧缓存原子化改造。
+
+---
+
+### 5. `inspection-flask/applications/models/admin_violate_photo.py`
+
+**改动类型**：ORM 约束放宽
+
+**改动内容**：
+
+- `violate_id` 从 `nullable=False` 改为 `nullable=True`，允许在规则 ID 未解析时仍以 `rule_code` 为主标识入库
+
+**改动原因**：与 M1 联动，消除 `WORKWEAR_VIOLATION_ID=None` 时所有违规记录无法入库的部署阻塞。
+
+---
+
+### 6. `inspection-flask/settings.py`
+
+**改动类型**：配置优化
+
+**改动内容**：
+
+- `LOG_PATH` 拆分为 `LOG_DIR`（目录）和 `LOG_FILE`（文件路径），消除变量语义不稳定问题
+- 新增 `WORKWEAR_VIOLATION_NAME = "未穿工服"` 配置项，使 rule_name 回退值可配置
+
+**改动原因**：P2-3 LOG_PATH 语义修复；P1-5 硬编码字符串配置化。
+
+---
+
 ## 2026-03-24 残留缺陷深度修正
 
 #### 1. `inspection-flask/applications/view/system/hk_camera.py`
