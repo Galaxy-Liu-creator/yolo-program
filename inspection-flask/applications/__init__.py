@@ -15,6 +15,7 @@ from applications.common.script import init_script
 from applications.config import BaseConfig
 from applications.extensions import init_plugs
 from applications.view import init_bps
+from utils.models import load_detection_models, select_runtime_device
 
 # ── 以下为尚未加入工程的旧 YOLOv5 模块，待对应文件补齐后按需恢复 ──────────────
 # from lying_module.Lying_Detect import Lying_Detect
@@ -39,27 +40,38 @@ def setup_logging(app):
     app.logger.addHandler(handler)
 
 
+def init_detection_models(app):
+    app.config["person_model"] = None
+    app.config["workwear_model"] = None
+    app.config["device"] = None
+    app.config["detection_pipeline_ready"] = False
+    app.config["detection_model_init_error"] = None
+
+    try:
+        device = select_runtime_device()
+        person_model, workwear_model = load_detection_models(device)
+    except Exception as exc:  # pragma: no cover - 依赖运行环境
+        app.config["detection_model_init_error"] = str(exc)
+        app.logger.exception("YOLOv11 模型初始化失败: %s", exc)
+        return
+
+    app.config["person_model"] = person_model
+    app.config["workwear_model"] = workwear_model
+    app.config["device"] = device
+    app.config["detection_pipeline_ready"] = True
+    app.logger.info("YOLOv11 模型初始化完成，device=%s", device)
+
+
 def create_app():
     app = Flask(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
     CORS(app)
     app.config.from_object(BaseConfig)
+    setup_logging(app)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # 第一阶段：模型加载（待 utils/models_v11.py 编写完成后解注释）
-    # TODO: 替换为 YOLOv11 推理封装，参考 yolov11_workwear_system_design.md
+    # 第一阶段：模型加载
     # ──────────────────────────────────────────────────────────────────────────
-    # from utils.models_v11 import load_detection_models
-    # device = select_device("0")
-    # person_model, workwear_model = load_detection_models(device)
-    # app.config['person_model']   = person_model    # YOLOv11 人员检测模型
-    # app.config['workwear_model'] = workwear_model  # YOLOv11 工服检测模型
-    # app.config['device']         = device
-    #
-    # 以下为旧警务专用模型，已弃用：
-    # app.config['smoke_phone_detect_model'] = ...  # 烟/手机，警务专用
-    # app.config['pose_net']                 = ...  # 姿态估计，警务专用
-    # app.config['face_detect_model']        = ...  # 人脸识别，警务专用
-    # app.config['lying_model']              = ...  # 躺检测，警务专用
+    init_detection_models(app)
     # ══════════════════════════════════════════════════════════════════════════
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -86,8 +98,6 @@ def create_app():
     init_bps(app)
     # 注册命令
     init_script(app)
-    # 配置日志
-    setup_logging(app)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 第三阶段：定时调度（不依赖模型，直接激活）
@@ -118,6 +128,7 @@ def create_app():
             args=(app,),
         )
         scheduler.start()
+        app.config["scheduler"] = scheduler
     # ══════════════════════════════════════════════════════════════════════════
 
     # 注册全局异常处理

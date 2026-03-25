@@ -7,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-import numpy as np
 
 import settings
 
@@ -16,35 +15,12 @@ _FAIL_COUNTS: dict[int, int] = {}
 _FAIL_WARN_THRESHOLD = 5
 
 
-def _build_placeholder_frame(camera) -> np.ndarray:
-    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-    frame[:, :] = (32, 32, 32)
-    cv2.putText(
-        frame,
-        f"Camera {camera.id}: {camera.name or camera.ip or 'demo'}",
-        (40, 120),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.1,
-        (0, 200, 255),
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame,
-        "No Hikvision stream — using placeholder frame for workwear detection.",
-        (40, 180),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-    return frame
-
-
 def _read_frame_from_camera(camera):
-    """从摄像头读取一帧。优先读取 frame_path 指定的图片文件（调试用），
-    若未配置或读取失败则返回占位帧，真实部署时此处替换为 HK SDK 取帧逻辑。"""
+    """从摄像头读取一帧。
+
+    优先读取 frame_path 指定的图片文件（调试用）。
+    若未配置或读取失败则返回 None，避免把占位图当作真实检测输入。
+    """
     frame_path = getattr(camera, "frame_path", None)
     if frame_path:
         image_path = Path(frame_path)
@@ -52,7 +28,7 @@ def _read_frame_from_camera(camera):
             image = cv2.imread(str(image_path))
             if image is not None:
                 return image
-    return _build_placeholder_frame(camera)
+    return None
 
 
 def get_img(cameras, app):
@@ -68,6 +44,8 @@ def get_img(cameras, app):
         if image is None or image.size == 0:
             _FAIL_COUNTS[cid] = _FAIL_COUNTS.get(cid, 0) + 1
             fail_count = _FAIL_COUNTS[cid]
+            app.config["hk_images"].pop(cid, None)
+            app.config["hk_images_datetime"].pop(cid, None)
             if fail_count == 1 or fail_count % _FAIL_WARN_THRESHOLD == 0:
                 app.logger.warning(
                     "camera %s 连续第 %d 次抓图失败，请检查设备连接或 frame_path 配置",
@@ -123,6 +101,14 @@ class HKRecorderThreadManager:
     def unregister_camera(self, camera_id):
         with self._lock:
             self.cameras.pop(str(camera_id), None)
+        try:
+            cache_key = int(camera_id)
+        except (TypeError, ValueError):
+            cache_key = camera_id
+        _FAIL_COUNTS.pop(cache_key, None)
+        if self.app is not None:
+            self.app.config.get("hk_images", {}).pop(cache_key, None)
+            self.app.config.get("hk_images_datetime", {}).pop(cache_key, None)
 
     def list_cameras(self):
         with self._lock:
@@ -133,7 +119,7 @@ class HKRecorderThreadManager:
         if app is None:
             return
 
-        camera_list = cameras or self.list_cameras()
+        camera_list = self.list_cameras() if cameras is None else cameras
         try:
             get_img(camera_list, app)
         except Exception as exc:  # pragma: no cover - 依赖运行环境

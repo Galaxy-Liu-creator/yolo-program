@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import settings
 
 try:
@@ -22,6 +24,13 @@ def select_runtime_device() -> str:
     return "cpu"
 
 
+def _validate_weight_path(weight_path, detector_name: str) -> Path:
+    path = Path(weight_path)
+    if not path.exists():
+        raise FileNotFoundError(f"{detector_name} 权重文件不存在: {path}")
+    return path
+
+
 class PersonDetector:
     """YOLOv11 人员检测器。
 
@@ -32,7 +41,8 @@ class PersonDetector:
     def __init__(self, weight_path, device: str = "cpu"):
         if not _ultralytics_available:
             raise ImportError("ultralytics 未安装，请执行 pip install ultralytics")
-        self.model = YOLO(str(weight_path))
+        path = _validate_weight_path(weight_path, "人员检测模型")
+        self.model = YOLO(str(path))
         self.device = device
 
     def infer(self, frame, conf_threshold: float = 0.55) -> list[dict]:
@@ -72,7 +82,8 @@ class WorkwearDetector:
     def __init__(self, weight_path, device: str = "cpu"):
         if not _ultralytics_available:
             raise ImportError("ultralytics 未安装，请执行 pip install ultralytics")
-        self.model = YOLO(str(weight_path))
+        path = _validate_weight_path(weight_path, "工服检测模型")
+        self.model = YOLO(str(path))
         self.device = device
 
     def infer(self, person_crop, conf_threshold: float = 0.45) -> list[dict]:
@@ -108,3 +119,11 @@ def load_person_detector(device: str = "cpu") -> PersonDetector:
 def load_workwear_detector(device: str = "cpu") -> WorkwearDetector:
     """根据 settings.WORKWEAR_WEIGHT 加载工服检测器。"""
     return WorkwearDetector(settings.WORKWEAR_WEIGHT, device)
+
+
+def load_detection_models(device: str | None = None) -> tuple[PersonDetector, WorkwearDetector]:
+    """统一加载 YOLOv11 人员模型与工服模型。"""
+    runtime_device = device or select_runtime_device()
+    person_model = load_person_detector(runtime_device)
+    workwear_model = load_workwear_detector(runtime_device)
+    return person_model, workwear_model

@@ -7,18 +7,18 @@ import time
 
 import cv2
 from flask import Blueprint, request, render_template, jsonify, current_app, Response
-from sqlalchemy import desc, asc
+from sqlalchemy import desc, asc, inspect, text
 from sqlalchemy.orm import aliased
 
 from applications.common import curd
 from applications.common.curd import enable_status, disable_status, get_one_by_id
-from applications.common.logic_judge import judging_cloth, draw_boxes
 # from applications.common.test import log_writer
 from applications.common.user_auth import dept_auth, sub_auth
 from applications.common.utils.http import fail_api, success_api, table_api
 from applications.common.utils.rights import authorize
 from applications.common.utils.thread_camera import detect
 
+import settings
 from applications.common.utils.validate import str_escape
 from applications.extensions import db
 from applications.models import Photo, HKCamera, Station, ViolatePhoto
@@ -380,7 +380,11 @@ def enable():
             dept_id=camera_instance.dept_id,
             channel=camera_instance.channel
         )
-        current_app.config['hk_threadManager'].add_thread(camera_info)
+        started = current_app.config['hk_threadManager'].add_thread(camera_info)
+        if not started:
+            init_error = current_app.config.get("detection_model_init_error") or "检测模型未就绪"
+            current_app.logger.error("工服检测线程 camera %s 启动失败: %s", id, init_error)
+            return fail_api(msg=f"启动失败：{init_error}")
         # add_new_detect(camera)
         # add_new_detect(camera.id, camera.camera_url, camera.station_id, camera.camera_type)
         return success_api(msg="启动成功")
@@ -425,6 +429,8 @@ def violations():
             "id": r.id,
             "camera_id": r.camera_id,
             "violate_id": r.violate_id,
+            "rule_code": r.rule_code,
+            "rule_name": r.rule_name,
             "href": r.href,
             "position_time": r.position_time.strftime("%Y-%m-%d %H:%M:%S") if r.position_time else None,
             "station_id": r.station_id,
@@ -451,6 +457,8 @@ def violations_by_camera(camera_id):
             "id": r.id,
             "camera_id": r.camera_id,
             "violate_id": r.violate_id,
+            "rule_code": r.rule_code,
+            "rule_name": r.rule_name,
             "href": r.href,
             "position_time": r.position_time.strftime("%Y-%m-%d %H:%M:%S") if r.position_time else None,
             "station_id": r.station_id,
@@ -462,8 +470,145 @@ def violations_by_camera(camera_id):
     return jsonify({"code": 0, "camera_id": camera_id, "count": len(data), "data": data})
 
 
-def save_violate_photo(type, id, frame, station_id, dept_id, sub_id, path,
-                       datetime=datetime.now(), rule_name=None, extra_meta=None):
+def _normalize_rule_value(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _coerce_rule_id(value):
+    normalized = _normalize_rule_value(value)
+    if normalized is None:
+        return None
+    try:
+        return int(normalized)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_violate_rule_columns():
+    cached_columns = current_app.config.get("violate_rule_table_columns")
+    if cached_columns is not None:
+        return cached_columns
+
+    inspector = inspect(db.engine)
+    if not inspector.has_table("admin_violate_rule"):
+        current_app.config["violate_rule_table_columns"] = set()
+        return set()
+
+    columns = {column["name"] for column in inspector.get_columns("admin_violate_rule")}
+    current_app.config["violate_rule_table_columns"] = columns
+    return columns
+
+
+def _query_violate_rule(columns, column_name, value):
+    if column_name not in columns:
+        return None
+
+    select_fields = ["id"]
+    if "rule_code" in columns:
+        select_fields.append("rule_code")
+    elif "code" in columns:
+        select_fields.append("code")
+
+    if "rule_name" in columns:
+        select_fields.append("rule_name")
+    elif "name" in columns:
+        select_fields.append("name")
+
+    sql = text(
+        f"SELECT {', '.join(select_fields)} "
+        f"FROM admin_violate_rule "
+        f"WHERE {column_name} = :value "
+        f"ORDER BY id ASC LIMIT 1"
+    )
+    return db.session.execute(sql, {"value": value}).mappings().first()
+
+
+def _extract_rule_meta(row):
+    if row is None:
+        return None, None, None
+
+    resolved_id = row.get("id")
+    resolved_code = row.get("rule_code") or row.get("code")
+    resolved_name = row.get("rule_name") or row.get("name")
+
+    try:
+        resolved_id = int(resolved_id)
+    except (TypeError, ValueError):
+        resolved_id = None
+
+    return resolved_id, _normalize_rule_value(resolved_code), _normalize_rule_value(resolved_name)
+
+
+def _resolve_violate_rule(rule_value, rule_name=None):
+    normalized_value = _normalize_rule_value(rule_value)
+    normalized_name = _normalize_rule_value(rule_name)
+    cache_key = (normalized_value, normalized_name)
+    cache = current_app.config.setdefault("violate_rule_resolution_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
+
+    resolved_id = _coerce_rule_id(normalized_value)
+    resolved_code = normalized_value if resolved_id is None else None
+    resolved_name = normalized_name
+    table_available = False
+
+    try:
+        columns = _load_violate_rule_columns()
+        table_available = bool(columns)
+        lookup_order = []
+
+        if resolved_id is not None and "id" in columns:
+            lookup_order.append(("id", resolved_id))
+        if resolved_code:
+            if "rule_code" in columns:
+                lookup_order.append(("rule_code", resolved_code))
+            if "code" in columns:
+                lookup_order.append(("code", resolved_code))
+        if resolved_name:
+            if "rule_name" in columns:
+                lookup_order.append(("rule_name", resolved_name))
+            if "name" in columns:
+                lookup_order.append(("name", resolved_name))
+
+        seen = set()
+        for column_name, value in lookup_order:
+            key = (column_name, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            row = _query_violate_rule(columns, column_name, value)
+            if row is None:
+                continue
+            resolved_id, db_rule_code, db_rule_name = _extract_rule_meta(row)
+            resolved_code = db_rule_code or resolved_code
+            resolved_name = db_rule_name or resolved_name
+            break
+    except Exception:
+        current_app.logger.exception("Resolve violate rule failed for value=%s", normalized_value)
+
+    if resolved_id is None and resolved_code:
+        default_rule_code = _normalize_rule_value(getattr(settings, "WORKWEAR_VIOLATION_TYPE", None))
+        configured_rule_id = _coerce_rule_id(getattr(settings, "WORKWEAR_VIOLATION_ID", None))
+        if configured_rule_id is not None and resolved_code == default_rule_code:
+            resolved_id = configured_rule_id
+
+    if resolved_name is None and resolved_code == _normalize_rule_value(getattr(settings, "WORKWEAR_VIOLATION_TYPE", None)):
+        resolved_name = "未穿工服"
+
+    if table_available and resolved_id is None:
+        result = (None, resolved_code, resolved_name)
+    else:
+        result = (resolved_id, resolved_code, resolved_name)
+
+    cache[cache_key] = result
+    return result
+
+
+def save_violate_photo(rule_value, id, frame, station_id, dept_id, sub_id, path,
+                       position_time=None, rule_name=None, extra_meta=None):
     """
     保存违规证据图并写入数据库。
     :param type:       违规类型 ID
@@ -473,17 +618,41 @@ def save_violate_photo(type, id, frame, station_id, dept_id, sub_id, path,
     :param dept_id:    单位 ID
     :param sub_id:     部门 ID
     :param path:       图片保存目录
-    :param datetime:   违规发生时间
+    :param position_time: 违规发生时间
     :param rule_name:  违规规则名称（如"未穿工服"），用于日志动态展示
     :param extra_meta: 扩展元数据（预留，暂不入库）
     """
     from applications.models import ViolatePhoto
+
+    if frame is None or getattr(frame, "size", 0) == 0:
+        current_app.logger.error("工服检测-摄像头ID：%s 证据图为空，取消落库", id)
+        return None
+
+    resolved_rule_id, resolved_rule_code, resolved_rule_name = _resolve_violate_rule(
+        rule_value,
+        rule_name=rule_name,
+    )
+    if resolved_rule_id is None:
+        current_app.logger.error(
+            "camera %s save violate photo aborted: unresolved violate rule value=%s rule_name=%s",
+            id,
+            rule_value,
+            rule_name,
+        )
+        return None
+
+    type = resolved_rule_id
+    rule_name = resolved_rule_name or rule_name
+
     unique_string = str(uuid.uuid4())
     filename = unique_string + '.jpg'
     file_url = '/_uploads/photos/' + filename
     if not os.path.exists(path):
         os.makedirs(path)
-    cv2.imwrite(os.path.join(path, filename), frame)
+    file_path = os.path.join(path, filename)
+    if not cv2.imwrite(file_path, frame):
+        current_app.logger.error("工服检测-摄像头ID：%s 证据图保存失败：%s", id, file_path)
+        return None
     href = file_url
     display_name = rule_name if rule_name else f"违规类型{type}"
     current_app.logger.warning(
@@ -492,11 +661,21 @@ def save_violate_photo(type, id, frame, station_id, dept_id, sub_id, path,
         violate_id=type,
         camera_id=id,
         href=href,
-        position_time=datetime,
+        position_time=position_time or datetime.now(),
         is_delete=0,
         station_id=station_id,
         sub_id=sub_id,
         dept_id=dept_id
     )
-    db.session.add(violatePhoto)
-    db.session.commit()
+    violatePhoto.rule_code = resolved_rule_code
+    violatePhoto.rule_name = resolved_rule_name
+    try:
+        db.session.add(violatePhoto)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        current_app.logger.exception("工服检测-摄像头ID：%s 违规记录写库失败，已回滚证据图", id)
+        return None
+    return href

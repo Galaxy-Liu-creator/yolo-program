@@ -37,6 +37,7 @@ class HKCustomThread(threading.Thread):
         self.window = deque(maxlen=getattr(settings, "TEMPORAL_WINDOW_SIZE", 5))
         self.last_processed_ts = None
         self.last_alert_ts = None
+        self._pipeline_error_logged = False
 
     def stop(self):
         self._running.clear()
@@ -54,8 +55,27 @@ class HKCustomThread(threading.Thread):
 
     def detect_persons(self, frame):
         """对整帧执行人员检测，返回检测器统一格式结果列表。"""
-        detector = self.app.config["person_model"]
+        detector = self.app.config.get("person_model")
+        if detector is None:
+            return []
         return detector.infer(frame, conf_threshold=getattr(settings, "PERSON_CONF", 0.55))
+
+    def _pipeline_ready(self) -> bool:
+        if self.app.config.get("detection_pipeline_ready", False):
+            self._pipeline_error_logged = False
+            return True
+
+        if not self._pipeline_error_logged:
+            init_error = self.app.config.get("detection_model_init_error") or (
+                "person_model / workwear_model 未完成初始化"
+            )
+            self.app.logger.error(
+                "camera %s 检测链路未就绪，线程等待中: %s",
+                self.camera.id,
+                init_error,
+            )
+            self._pipeline_error_logged = True
+        return False
 
     def _in_roi(self, bbox: list) -> bool:
         roi = getattr(self.camera, "roi", None)
@@ -83,7 +103,9 @@ class HKCustomThread(threading.Thread):
           False（默认）：直接裁剪人员框
           True：先将框外区域替换为白色再裁剪（兼容白底训练数据）
         """
-        workwear_detector = self.app.config["workwear_model"]
+        workwear_detector = self.app.config.get("workwear_model")
+        if workwear_detector is None:
+            return []
         min_area = getattr(settings, "MIN_PERSON_BOX_AREA", 3000)
         workwear_conf = getattr(settings, "WORKWEAR_CONF", 0.45)
         use_white_bg = getattr(settings, "USE_WHITE_BG_MASK", False)
@@ -175,49 +197,56 @@ class HKCustomThread(threading.Thread):
         recorder_manager.register_camera(self.camera)
         self.app.logger.info("camera %s 工服检测线程启动", self.camera.id)
 
-        while self._running.is_set():
-            try:
-                frame, timestamp = self.fetch_frame()
-                if frame is None:
-                    recorder_manager.run_once(app=self.app, cameras=[self.camera])
+        try:
+            while self._running.is_set():
+                try:
+                    if not self._pipeline_ready():
+                        time.sleep(idle)
+                        continue
+
+                    frame, timestamp = self.fetch_frame()
+                    if frame is None:
+                        recorder_manager.run_once(app=self.app, cameras=[self.camera])
+                        time.sleep(idle)
+                        continue
+
+                    persons = self.detect_persons(frame)
+                    person_contexts = self.build_person_contexts(frame, persons)
+                    self.window.append(
+                        {
+                            "camera_id": self.camera.id,
+                            "timestamp": timestamp,
+                            "frame": frame,
+                            "persons": person_contexts,
+                        }
+                    )
+
+                    window_size = getattr(settings, "TEMPORAL_WINDOW_SIZE", 5)
+                    if len(self.window) < window_size:
+                        time.sleep(round_sleep)
+                        continue
+
+                    if self._alert_suppressed(timestamp):
+                        time.sleep(round_sleep)
+                        continue
+
+                    triggered = self.run_rule_engine()
+                    if triggered:
+                        self.last_alert_ts = timestamp
+                        self.window.clear()
+                        self.emit_event(triggered)
+
+                    time.sleep(round_sleep)
+
+                except Exception as exc:  # pragma: no cover
+                    trace = traceback.format_exc()
+                    self.app.logger.error(
+                        "camera %s 检测循环异常: %s\n%s", self.camera.id, exc, trace
+                    )
                     time.sleep(idle)
-                    continue
-
-                persons = self.detect_persons(frame)
-                person_contexts = self.build_person_contexts(frame, persons)
-                self.window.append(
-                    {
-                        "camera_id": self.camera.id,
-                        "timestamp": timestamp,
-                        "frame": frame,
-                        "persons": person_contexts,
-                    }
-                )
-
-                window_size = getattr(settings, "TEMPORAL_WINDOW_SIZE", 5)
-                if len(self.window) < window_size:
-                    time.sleep(round_sleep)
-                    continue
-
-                if self._alert_suppressed(timestamp):
-                    time.sleep(round_sleep)
-                    continue
-
-                triggered = self.run_rule_engine()
-                if triggered:
-                    self.last_alert_ts = timestamp
-                    self.emit_event(triggered)
-
-                time.sleep(round_sleep)
-
-            except Exception as exc:  # pragma: no cover
-                trace = traceback.format_exc()
-                self.app.logger.error(
-                    "camera %s 检测循环异常: %s\n%s", self.camera.id, exc, trace
-                )
-                time.sleep(idle)
-
-        self.app.logger.info("camera %s 工服检测线程已停止", self.camera.id)
+        finally:
+            recorder_manager.unregister_camera(self.camera.id)
+            self.app.logger.info("camera %s 工服检测线程已停止", self.camera.id)
 
 
 class ThreadManager:
@@ -231,6 +260,16 @@ class ThreadManager:
 
     def add_thread(self, camera) -> bool:
         if self.app is None:
+            return False
+        if not self.app.config.get("detection_pipeline_ready", False):
+            init_error = self.app.config.get("detection_model_init_error") or (
+                "YOLOv11 检测模型未完成初始化"
+            )
+            self.app.logger.error(
+                "camera %s 检测线程启动失败: %s",
+                camera.id,
+                init_error,
+            )
             return False
 
         camera_id = str(camera.id)
@@ -252,6 +291,8 @@ class ThreadManager:
             return False
         thread.stop()
         thread.join(timeout=1.0)
+        if thread.is_alive() and self.app is not None:
+            self.app.logger.warning("camera %s 检测线程未在超时时间内退出", camera_id)
         return True
 
     def stop_all_threads(self, app=None):

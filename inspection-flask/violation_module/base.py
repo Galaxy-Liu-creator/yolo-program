@@ -1,9 +1,6 @@
-import copy
-import os
-import uuid
 from abc import ABCMeta, abstractmethod
 
-import cv2
+from flask import current_app, has_app_context
 
 import settings
 
@@ -11,59 +8,101 @@ from utils.plots import plot_one_box, plot_txt_PIL
 
 
 def format_targets_for_log(original_targets):
-    filtered_targets = []
-    _targets = copy.deepcopy(original_targets)
-    for each_frame in _targets:
-        filtered_frame = []
-        for person in each_frame:
-            if person[5] == 'person' and len(person) == 9 and person[4] > 0:  # 替换为实际阈值
-                # 删除 person[7]
-                del person[7]
-                filtered_frame.append(person)
-        filtered_targets.append(filtered_frame)
-    _targets = filtered_targets
-    return _targets
+    formatted_targets = []
+    if not isinstance(original_targets, list):
+        return formatted_targets
+
+    for frame_item in original_targets:
+        if isinstance(frame_item, dict):
+            persons = frame_item.get("persons", [])
+            formatted_targets.append(
+                {
+                    "camera_id": frame_item.get("camera_id"),
+                    "timestamp": str(frame_item.get("timestamp")),
+                    "persons": [
+                        {
+                            "bbox": person.get("bbox"),
+                            "confidence": person.get("confidence"),
+                            "label": person.get("label"),
+                            "has_workwear": person.get("has_workwear"),
+                            "workwear_count": len(person.get("workwear_items", []))
+                            if isinstance(person.get("workwear_items", []), list)
+                            else 0,
+                        }
+                        for person in persons
+                        if isinstance(person, dict)
+                    ],
+                }
+            )
+            continue
+
+        if not isinstance(frame_item, list):
+            continue
+
+        legacy_persons = []
+        for person in frame_item:
+            if not isinstance(person, list) or len(person) < 6:
+                continue
+            if person[5] != "person":
+                continue
+            legacy_persons.append(person[:7])
+        formatted_targets.append(legacy_persons)
+
+    return formatted_targets
+
+
+def _iter_plot_boxes(target_group):
+    if not isinstance(target_group, list):
+        return
+
+    for item in target_group:
+        if isinstance(item, list) and len(item) >= 6 and not isinstance(item[0], list):
+            yield item
+            continue
+        if isinstance(item, list):
+            for nested in item:
+                if isinstance(nested, list) and len(nested) >= 6:
+                    yield nested
+
+
+def _extract_plot_confidence(target_group) -> float:
+    if (
+        isinstance(target_group, list)
+        and len(target_group) >= 3
+        and isinstance(target_group[2], (int, float))
+    ):
+        return float(target_group[2])
+
+    confidences = []
+    for target in _iter_plot_boxes(target_group):
+        try:
+            confidences.append(float(target[4]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return max(confidences, default=float("-inf"))
 
 
 class BaseVio(metaclass=ABCMeta):
-    # 有效人员标签（子类可按需覆盖）
-    person_label = ['person']
-    # 违规类型
-    vio_type = ""
-    # 摄像头信息
-    camera_id = ""
-    # 原图
-    frames = []
-    # time_list 对应图片时间
-    datatime_list = []
-    # 对应frame的检测结果
-    targets = []
-    # 监控站点id
-    station_id = ""
-    # 所属单位id
-    dept_id = ""
-    # 上级单位id
-    sub_id = ""
-    # 存放符合违规的信息
-    plot_targets = {}
+    person_label = ["person"]
+    vio_type = None
+    camera_id = None
+    frames = None
+    datetime_list = None
+    targets = None
+    station_id = None
+    dept_id = None
+    sub_id = None
+    plot_targets = None
 
     def __init__(self):
         self.vio_type = ""
-        # 摄像头信息
         self.camera_id = ""
-        # 原图
         self.frames = []
-        # time_list 对应图片时间
-        self.datatime_list = []
-        # 对应frame的检测结果
+        self.datetime_list = []
         self.targets = []
-        # 监控站点id
         self.station_id = ""
-        # 所属单位id
         self.dept_id = ""
-        # 上级单位id
         self.sub_id = ""
-        # 存放符合违规的信息
         self.plot_targets = {}
 
     def init(self, frames, datetime_list, targets, vio_type=None, camera_id=None, station_id=None, dept_id=None,
@@ -89,22 +128,18 @@ class BaseVio(metaclass=ABCMeta):
             self.plot_targets[key] = [up_box_list]
 
     def save(self, name, box_color=None):
-        """
-        从 plot_targets 中挑选置信度最高的帧，绘制检测框和违规标注，
-        保存证据图并写入数据库。
-        :param name:      违规名称，将叠加到证据图左上角
-        :param box_color: 标注框颜色（BGR），默认橙色 [0, 165, 255]
-        :return: None
-        """
+        """从 plot_targets 中挑选置信度最高的帧并保存证据图。"""
         from applications.view.system.hk_camera import save_violate_photo
-        from app import app
 
         color = box_color if box_color is not None else [0, 165, 255]
 
-        max_conf = float('-inf')
+        max_conf = float("-inf")
         max_conf_each = None
         for each, lists in self.plot_targets.items():
-            max_each_conf = max(lists, key=lambda x: x[2])[2]
+            max_each_conf = max(
+                (_extract_plot_confidence(target_group) for target_group in lists),
+                default=float("-inf"),
+            )
             if max_each_conf > max_conf:
                 max_conf = max_each_conf
                 max_conf_each = each
@@ -114,45 +149,66 @@ class BaseVio(metaclass=ABCMeta):
             return None
 
         max_conf_lists = self.plot_targets[max_conf_each]
-        vio_image = self.frames[max_conf_each].copy()
-        if max_conf_lists:
-            app.logger.warning(
-                f"工服检测-摄像头 {self.camera_id} 触发告警，即将保存证据图，本轮目标：{format_targets_for_log(self.targets)}")
-            for target_list in max_conf_lists:
-                if isinstance(target_list, list) and len(target_list) == 3:
-                    for target in target_list:
-                        if isinstance(target, list) and len(target) >= 6:
-                            app.logger.warning(
-                                f"工服检测-摄像头 {self.camera_id} 标注框：{target[:4]} 标签={target[5]} 置信度={target[4]:.2f}")
-                            plot_one_box(target[:4], vio_image, color=color,
-                                         label=f"{target[5]} {target[4]:.2f}",
-                                         line_thickness=1)
-            vio_image = plot_txt_PIL(box=[20, 20], img=vio_image, label=name, color=color)
-            with app.app_context():
-                save_violate_photo(self.vio_type, self.camera_id, vio_image,
-                                   self.station_id, self.dept_id, self.sub_id,
-                                   settings.VIO_IMAGE_PATH,
-                                   self.datetime_list[max_conf_each],
-                                   rule_name=name)
+        source_frame = self.frames[max_conf_each]
+        if source_frame is None or not max_conf_lists:
             self.plot_targets.clear()
-            return True
+            return None
+
+        if has_app_context():
+            logger = current_app.logger
+
+            def save_with_context(*args, **kwargs):
+                return save_violate_photo(*args, **kwargs)
+        else:
+            from app import app
+
+            logger = app.logger
+
+            def save_with_context(*args, **kwargs):
+                with app.app_context():
+                    return save_violate_photo(*args, **kwargs)
+
+        vio_image = source_frame.copy()
+        logger.warning(
+            "工服检测-摄像头 %s 触发告警，即将保存证据图，本轮目标：%s",
+            self.camera_id,
+            format_targets_for_log(self.targets),
+        )
+        for target_list in max_conf_lists:
+            for target in _iter_plot_boxes(target_list):
+                try:
+                    confidence = float(target[4])
+                except (TypeError, ValueError, IndexError):
+                    continue
+
+                logger.warning(
+                    "工服检测-摄像头 %s 标注框：%s 标签=%s 置信度=%.2f",
+                    self.camera_id,
+                    target[:4],
+                    target[5],
+                    confidence,
+                )
+                plot_one_box(
+                    target[:4],
+                    vio_image,
+                    color=color,
+                    label=f"{target[5]} {confidence:.2f}",
+                    line_thickness=1,
+                )
+
+        vio_image = plot_txt_PIL(box=[20, 20], img=vio_image, label=name, color=color)
+        save_result = save_with_context(
+            self.vio_type,
+            self.camera_id,
+            vio_image,
+            self.station_id,
+            self.dept_id,
+            self.sub_id,
+            settings.VIO_IMAGE_PATH,
+            self.datetime_list[max_conf_each] if max_conf_each < len(self.datetime_list) else None,
+            rule_name=name,
+        )
         self.plot_targets.clear()
+        if save_result:
+            return True
         return None
-    # def save(self, image, vio_name, targets=None):
-    #     """
-    #     :param image:  frames里面置信度最高的违规原图
-    #     :param vio_name:   违规名称
-    #     :param target:   target是一个list嵌套,包含了要打的所有框[[x1,y1,x2,y2,conf,class_name],[x1,y1,x2,y2,conf,class_name]]
-    #     """
-    #     vio_image = image.copy()
-    #     if targets:
-    #         for target in targets:
-    #             plot_one_box(target[:4], vio_image, color=[0, 0, 255], label=f"{target[5]} {target[4]:.2f}",
-    #                          line_thickness=1)
-    #     vio_image = plot_txt_PIL(box=[20, 20], img=vio_image, label=vio_name, color=[0, 0, 255], )
-    #     unique_string = str(uuid.uuid4())
-    #     filename = unique_string + '.jpg'
-    #     cv2.imwrite(os.path.join(settings.VIO_IMAGE_PATH, filename), vio_image)
-    #     # 虚拟访问地址
-    #     file_url = settings.VIO_IMAGE_PATH + filename
-    #     return file_url

@@ -47,6 +47,7 @@ MIN_PERSON_BOX_AREA = 3000
 
 # 违规规则编码（写入数据库 rule_code 字段）
 WORKWEAR_VIOLATION_TYPE = "workwear_missing"
+WORKWEAR_VIOLATION_ID = None
 
 # ─── 时序稳定性配置 ────────────────────────────────────────────────────────────
 # 时间窗口帧数：最近 N 帧用于比例判定

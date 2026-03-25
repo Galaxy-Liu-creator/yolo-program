@@ -1,15 +1,76 @@
 # 代码修改记录
 
+## 2026-03-24 残留缺陷深度修正
+
+#### 1. `inspection-flask/applications/view/system/hk_camera.py`
+
+**改动类型**：Bug 修复（P0 × 2）
+
+**改动内容**：
+
+- 删除第 15 行 `from applications.common.logic_judge import judging_cloth, draw_boxes`。`logic_judge.py` 已在上一轮完全重写，这两个函数不再存在，导入行会在启动时触发 `ImportError` 阻塞整个 Flask 蓝图注册。全文确认无任何调用点，属于纯死代码。
+- 在顶部 import 区域添加 `import settings`。`_resolve_violate_rule()` 在回退分支中通过 `getattr(settings, "WORKWEAR_VIOLATION_TYPE", None)` 和 `getattr(settings, "WORKWEAR_VIOLATION_ID", None)` 读取配置，但文件原先缺少该导入，会在首次违规证据保存时触发 `NameError`。
+
+**改动原因**：两处均为阻塞性缺陷——前者阻止应用启动，后者阻止违规证据落库。
+
+---
+
+#### 2. `inspection-flask/applications/common/hk_custom_threading_plus.py`
+
+**改动类型**：Bug 修复（P1 × 2）
+
+**改动内容**：
+
+- 在告警触发块（`if triggered:` 分支）中，在 `self.last_alert_ts = timestamp` 之后加入 `self.window.clear()`。修复前，触发违规后旧帧保留在窗口中，当告警抑制窗口结束后 `run_rule_engine()` 仍基于旧帧计算，极可能立即再次触发，形成"抑制结束即重复告警"的循环。
+- 从 `stop_thread()` 中移除 `recorder_manager.unregister_camera(camera_id)` 调用（原第 293-295 行）。线程的 `run()` 方法 `finally` 块已负责调用 `recorder_manager.unregister_camera(self.camera.id)`，`stop_thread()` 重复调用属于冗余操作，且两处传入的 `camera_id` 类型可能不一致（`str` vs `int`），存在边界风险。统一由线程 `finally` 块负责注销。
+
+**改动原因**：窗口未清空直接影响检测正确性（重复告警）；重复注销虽不一定崩溃但属于生命周期管理漏洞。
+
+---
+
+#### 3. `inspection-flask/applications/common/logic_judge.py`
+
+**改动类型**：文档修正（P2）
+
+**改动内容**：
+
+- `draw_person_workwear_boxes()` 的 docstring 颜色描述从"人员框：蓝色"修正为"合规：绿色 / 违规：红色 / 工服框：深绿色"，与实际代码使用的 `(0, 200, 0)`、`(0, 0, 220)`、`(0, 180, 0)` 一致。
+
+**改动原因**：文档与实现不一致会误导调试时的视觉判断。
+
+---
+
+#### 4. `inspection-flask/violation_module/base.py`
+
+**改动类型**：代码质量修正（P2）
+
+**改动内容**：
+
+- 将 `BaseVio` 的类级别可变默认值 `frames = []`、`datetime_list = []`、`targets = []`、`plot_targets = {}` 以及字符串空值 `vio_type = ""`、`camera_id = ""` 等统一改为 `None`。`__init__()` 保持不变（已正确创建独立的实例属性）。
+
+**改动原因**：Python 类级别可变容器是常见的共享状态陷阱。虽然当前 `__init__` 会覆盖，但将类属性设为 `None` 可防止未来子类遗漏调用 `super().__init__()` 时意外共享数据。
+
+---
+
 ## 第一阶段初步工作总结与下一阶段预期工作
 
-### 第一阶段初步工作总结
+### 2026-03-24 深度修正补充
+
+- 已补齐 `inspection-flask/applications/__init__.py` 的 YOLOv11 模型初始化闭环：启动时直接调用 `inspection-，flask/utils/models.py` 加载 `person_model` 与 `workwear_model`，并将 `detection_pipeline_ready`、`detection_model_init_error`、`device` 明确写入 `app.config`，避免线程启动后才因缺少模型对象崩溃。
+- 已收紧 `inspection-flask/utils/models.py` 的模型装配口径：新增权重路径存在性校验与 `load_detection_models()` 统一入口，避免“配置了模型但权重文件不存在”时的隐式失败。
+- 已修复 `inspection-flask/applications/common/hk_custom_threading_plus.py` 的线程生命周期问题：检测线程在模型未就绪时拒绝启动；运行退出时会注销 recorder 注册；`stop_thread()` 现在会同步解除摄像头注册并清理遗留抓图状态，避免停用摄像头后 recorder 仍继续取帧。
+- 已修复 `inspection-flask/applications/common/hk_recorder_threading.py` 的占位帧污染问题：抓图失败时不再注入 placeholder frame 参与推理，而是明确返回失败并清空对应缓存，避免设备异常被“假图正常推理”掩盖。
+- 已修复 `inspection-flask/violation_module/base.py` 与新时间窗结构不兼容的问题：`format_targets_for_log()` 现已兼容 `{"camera_id","timestamp","frame","persons"}` 的窗口字典结构，`save()` 也改为基于新 `plot_targets` 结构选帧、绘框、保存，避免首个真实告警时因日志格式化或目标遍历方式错误而中断。
+- 已修复 `inspection-flask/applications/view/system/hk_camera.py` 的证据图落盘一致性问题：`save_violate_photo()` 现在会检查 `cv2.imwrite()` 返回值，并在数据库写入失败时回滚记录并删除已写入的证据图文件，避免图库与数据库状态不一致。
+
+### 第一阶段工作总结与严谨性评估
+
+已完成的核心工作：
 
 - 已完成 `inspection-flask/violation_module/vio_zsmjwcjf.py` 与 `inspection-flask/violation_module/vio_workwear_missing.py` 的职责合并。
 - 现在正式的未穿工服规则实现位于 `inspection-flask/violation_module/vio_workwear_missing.py`，旧文件 `vio_zsmjwcjf.py` 仅保留兼容导出，避免历史命名继续承载业务逻辑。
 - 规则判定已从“未穿警服”的遗留语义切换为“未穿工服”，并对齐当前 YOLOv11 双模型链路的数据结构：上游输入为 `persons -> workwear_items`，规则输出继续复用 `BaseVio.save()` 的抓拍落库流程。
 - 本轮同时收紧了规则判定口径：空的 `WORKWEAR_LABELS` 不再直接放大误报；时间窗比例改为“违规帧数 / 有效人员帧数”，避免无人帧、无效框帧冲淡触发比例；绘图缓存不再重复添加两次相同的人框。
-
-### 当前代码逻辑是否足够严谨
 
 结论：当前代码已经可以“初步实现”基于 YOLOv11 的加油站工人未穿工服检测，但距离可稳定上线还有明显差距。
 
@@ -30,6 +91,7 @@
 - 第一优先级：恢复并统一 `applications/__init__.py` 的模型装配，明确 YOLOv11 人检模型、工服模型、线程管理器和缓存容器的正式初始化入口，先解决“代码存在但启动链不闭环”的问题。
 - 第二优先级：把 `utils/models.py`、`hk_custom_threading_plus.py`、`logic_judge.py` 的 YOLOv11 适配层再抽象一层，统一成稳定的 `person_context` 协议，避免业务规则继续感知底层模型细节。
 - 第三优先级：把当前摄像头级时间窗升级为“人员级时序判定”，至少补上目标跟踪或轻量 ID 关联，降低多人场景下的误触发与误抑制。
+- 第三优先级之二：将 ROI 判定从“整框完全落入”升级为更稳健的交并比或中心点策略，减少边缘目标被过严过滤。
 - 第四优先级：补齐样例测试与可视化调试能力，包括典型正样本、遮挡负样本、ROI 边缘样本、小目标样本，以及抓拍图与裁剪图联动排查工具。
 - 第五优先级：评估是否要把“未穿工服”扩展为更完整的 PPE 规则引擎，把工服、反光背心、安全帽等统一纳入可配置规则，而不是继续靠单一 `WORKWEAR_LABELS` 列表硬编码。
 
@@ -40,7 +102,7 @@
 
 ## 2026-03-24 Section 6 合并未穿工服规则模块并修正判定口径
 
-### 1. `inspection-flask/violation_module/vio_workwear_missing.py` 
+### 1. `inspection-flask/violation_module/vio_workwear_missing.py`
 
 - 由原先的单行转发文件改为正式规则实现文件。
 - 新建 `WorkwearMissingViolation(BaseVio)`，作为未穿工服场景的唯一主实现。
@@ -49,7 +111,7 @@
 - 当 `WORKWEAR_LABELS` 为空或时间窗内没有任何有效人员时，直接返回 `None` 并清空 `plot_targets`，避免配置错误导致整窗误报。
 - `_add_person_to_plot()` 改为只缓存一份人体框，去掉原先重复追加两次相同人框的绘图冗余。
 
-### 2. `inspection-flask/violation_module/vio_zsmjwcjf.py` 
+### 2. `inspection-flask/violation_module/vio_zsmjwcjf.py`
 
 - 改为兼容入口文件：仅从 `vio_workwear_missing.py` 重新导出 `WorkwearMissingViolation`。
 - 这样可以兼容历史导入路径，同时把正式业务语义收敛到“未穿工服”而不是继续挂在旧的“未穿警服”文件名下。
@@ -99,23 +161,28 @@
 **改动内容**：
 
 **新增模块级辅助函数 `_make_white_bg_crop(frame, bbox)`**：
+
 - 将帧中人员框外区域替换为白色后裁剪，对应原 YOLOv5 `add_white_background` 逻辑
 - 当 `settings.USE_WHITE_BG_MASK=True` 时由 `build_person_contexts()` 调用
 
-**`build_person_contexts()` 新增白底遮罩开关**：
+`**build_person_contexts()` 新增白底遮罩开关**：
+
 - 读取 `getattr(settings, "USE_WHITE_BG_MASK", False)`
 - `True`：使用 `_make_white_bg_crop()` 裁剪；`False`（默认）：使用 `_crop_person()` 直接裁剪
 - `has_workwear` 判定：从 `workwear_items` 中过滤 `label in WORKWEAR_LABELS` 的命中，而非单纯判空（确保未训练类别不算合规）
 
-**`restart_all_threads()` 修复**：
+`**restart_all_threads()` 修复**：
+
 - 原版使用 `app.config["camera_registry"]`，不保证初始化、可能 KeyError
 - 改为 `HKCamera.query.filter_by(is_delete=0, enable=1).all()` 直接查数据库，与旧版逻辑对齐
 
-**`emit_event()` 修复**：
+`**emit_event()` 修复**：
+
 - 原版要求 `event` 必须是 `dict`，但 `violation.run()` 触发时返回 `True`（保存已在 `base.py` 完成）
 - 改为接受任意真值，日志直接输出摄像头告警信息
 
 **告警抑制修复**：
+
 - 原 `if event:` 因 `save()` 返回 `None` 永不进入，`self.last_alert_ts` 从不更新，抑制逻辑失效
 - 现 `base.py.save()` 触发时返回 `True`，`triggered = violation.run()` 可正确更新 `last_alert_ts`
 
@@ -289,7 +356,7 @@
 **改动内容**：
 
 - `save()` 调用 `save_violate_photo()` 时补传 `rule_name=name`，使日志和数据库中实际展示违规名称，而非"违规类型xxx"占位
-- 类属性及 `__init__` 中注释清理：
+- 类属性及 `__init_`_ 中注释清理：
   - `"审讯室/值班室id"` → `"监控站点id"`
   - `"单位id 例如：xx派出所"` → `"所属单位id"`
   - `"部门id 例如：东营市公安分局"` → `"上级单位id"`
@@ -314,10 +381,12 @@
 **改动内容**：
 
 **类属性清理**：
+
 - 删除 `clothes_labels = {'coat', 'cloth', 'shirt'}`，该属性是警服类别的硬编码，不应出现在通用基类中；工服类别将在 `settings.py` 中以 `WORKWEAR_LABELS` 配置项的形式定义，由子类读取
 - 将 `person_label` 从 `['person', 'fu_person', 'person_szf']` 精简为 `['person']`，去掉 `fu_person`、`person_szf` 等警务场景专属标签；子类可按需覆盖
 
-**`save()` 方法**：
+`**save()` 方法**：
+
 - 新增可选参数 `box_color: list = None`，默认值为橙色 `[0, 165, 255]`（BGR），工服告警在视觉上与红色框区分；`plot_one_box` 和 `plot_txt_PIL` 统一使用 `color` 变量，不再硬编码 `[0, 0, 255]`
 - 增加越界保护：在访问 `self.frames[max_conf_each]` 之前判断 `max_conf_each is None or max_conf_each >= len(self.frames)`，条件成立时清空 `plot_targets` 并提前返回 `None`，防止帧缓存与目标索引不一致时崩溃
 - 将所有日志从原有的警务语义改为工服检测语义，例如"工服检测-摄像头 X 触发告警，即将保存证据图"和"工服检测-摄像头 X 标注框：... 标签=... 置信度=..."
@@ -334,21 +403,25 @@
 
 **改动内容**：
 
-**`save_violate_photo()` 函数**：
+`**save_violate_photo()` 函数**：
+
 - 新增可选参数 `rule_name=None` 和 `extra_meta=None`
   - `rule_name`：违规规则名称（如"未穿工服"），用于日志动态展示，后续调用方传入即可
   - `extra_meta`：扩展元数据预留字段，当前暂不入库，为后续多规则扩展保留接口
 - 移除原有 `if type == 21 or type == '21':` 的硬编码"未穿警服"日志分支，替换为动态日志：`display_name = rule_name if rule_name else f"违规类型{type}"`，统一输出格式为"工服检测-摄像头ID：X [规则名] 证据图已保存：..."
 - 补充完整中文 docstring，说明所有参数用途
 
-**`dis_enable()` 函数**：
+`**dis_enable()` 函数**：
+
 - 将 `print(f"{_id}关闭成功")` 和 `print(f"{_id}关闭失败")` 替换为 `current_app.logger.info/warning`，统一日志输出渠道，文案改为"工服检测线程 camera X 已关闭/关闭失败"
 
 **新增 `GET /hk_camera/violations` 端点**：
+
 - 支持 `camera_id`（int，可选）和 `limit`（int，可选，默认 100，上限 500）两个 query 参数
 - 按摄像头过滤并返回最新 N 条违规记录，响应体包含 `code`、`count`、`data` 字段
 
 **新增 `GET /hk_camera/violations/camera/<int:camera_id>` 端点**：
+
 - 按摄像头 ID 查询该摄像头全部违规记录，最多返回最新 200 条
 - 响应体包含 `code`、`camera_id`、`count`、`data` 字段
 
@@ -404,25 +477,30 @@
 
 **改动内容**：
 
-**`_alert_suppressed()` 方法**：
+`**_alert_suppressed()` 方法**：
+
 - `settings.alert_suppression_seconds` 改为 `getattr(settings, "alert_suppression_seconds", 300)`，防止 `settings.py` 未定义该字段时抛出 `AttributeError`
 
-**`run_rule_engine()` 方法**：
+`**run_rule_engine()` 方法**：
+
 - `settings.WORKWEAR_VIOLATION_TYPE` 改为 `getattr(settings, "WORKWEAR_VIOLATION_TYPE", "workwear_missing")`，加缺省回退
 - `camera.station_id`、`camera.dept_id`、`camera.sub_id` 均改为 `getattr(self.camera, ..., None)`，兼容没有该字段的摄像头对象
 - 补充 docstring，说明该方法的返回值语义
 
-**`emit_event()` 方法**：
+`**emit_event()` 方法**：
+
 - 增加 `isinstance(event, dict)` 类型检查，避免 `None` 或异常对象写入队列
 - 日志格式改为中文，输出内容扩展为：`rule_name`（或 `rule_code`）、`position_time`、证据图 `href`，便于日志直接定位问题
 
-**`run()` 方法**：
+`**run()` 方法**：
+
 - `settings.thread_idle_sleep` 和 `settings.round_interval` 均改为 `getattr` 缺省回退（默认值分别为 `2` 秒和 `0`）
 - `settings.TEMPORAL_WINDOW_SIZE` 改为 `getattr` 读取，默认 `5`
 - 线程启动时打印"camera X 工服检测线程启动"，停止时打印"camera X 工服检测线程已停止"
 - 检测循环异常日志从英文改为中文
 
-**`restart_all_threads()` 方法**：
+`**restart_all_threads()` 方法**：
+
 - 错峰启动间隔从 `0.1s` 调整为 `0.2s`，减少多摄像头同时初始化时的资源竞争
 - 日志从 `warning` 级别改为 `info`，文案改为中文"重启工服检测线程 camera X"
 
@@ -449,6 +527,13 @@
 ```
 
 字段说明：
+
 - **改动类型**：可填"新增文件""细微修改""重构""接口扩展""Bug 修复""配置调整"等
 - **改动内容**：具体到函数/变量/参数级别，方便定位
 - **改动原因**：说明为什么这样改，而不只是描述改了什么
+# 2026-03-24 Rule Code / Rule ID Supplement
+
+- `inspection-flask/setting.py` keeps `WORKWEAR_VIOLATION_TYPE = "workwear_missing"` as the business rule code and adds `WORKWEAR_VIOLATION_ID = None` as an optional fallback.
+- `inspection-flask/applications/view/system/hk_camera.py::save_violate_photo` now resolves rule code or numeric rule id into `ViolatePhoto.violate_id` before persistence, and also backfills `rule_code` plus `rule_name`.
+- Rule resolution prefers `admin_violate_rule` table lookup by `rule_code`/`code`/`rule_name`/`name`, then falls back to `WORKWEAR_VIOLATION_ID`.
+
