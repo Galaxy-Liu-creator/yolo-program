@@ -46,10 +46,16 @@ class PersonDetector:
         self.device = device
 
     def infer(self, frame, conf_threshold: float = 0.55) -> list[dict]:
-        """对整帧图像执行人员检测，返回置信度高于阈值的人员目标列表。"""
+        """对整帧图像执行人员检测，返回置信度高于阈值的监管对象列表。
+
+        过滤标签由 settings.MONITORED_PERSON_LABELS 驱动，不硬绑 "person"。
+        """
+        monitored = set(getattr(settings, "MONITORED_PERSON_LABELS", ["person"]))
+        imgsz = getattr(settings, "IMGSZ", 640)
         results = self.model(
             frame,
             conf=conf_threshold,
+            imgsz=imgsz,
             device=self.device,
             verbose=False,
         )
@@ -57,7 +63,7 @@ class PersonDetector:
         for result in results:
             for box in result.boxes:
                 label = result.names[int(box.cls)]
-                if label != "person":
+                if label not in monitored:
                     continue
                 x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
                 detections.append(
@@ -90,9 +96,11 @@ class WorkwearDetector:
         """对人员裁剪图执行工服检测，返回检测到的工服目标列表。"""
         if person_crop is None or person_crop.size == 0:
             return []
+        imgsz = getattr(settings, "IMGSZ", 640)
         results = self.model(
             person_crop,
             conf=conf_threshold,
+            imgsz=imgsz,
             device=self.device,
             verbose=False,
         )

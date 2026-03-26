@@ -11,6 +11,83 @@ import settings
 from violation_module.vio_workwear_missing import WorkwearMissingViolation
 
 
+class SimpleIoUTracker:
+    """基于 IoU 的帧间目标关联，为每个人员分配稳定的 track_id。
+
+    固定机位、帧间隔 2 秒左右的加油站场景下，
+    IoU 贪心匹配足够区分连续出现的同一人和不同人。
+    """
+
+    def __init__(self, iou_threshold: float = 0.3):
+        self.iou_threshold = iou_threshold
+        self._next_id = 0
+        self._prev_tracks: list[dict] = []
+
+    @staticmethod
+    def _compute_iou(box_a: list, box_b: list) -> float:
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if inter == 0:
+            return 0.0
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _alloc_id(self) -> int:
+        tid = self._next_id
+        self._next_id += 1
+        return tid
+
+    def update(self, person_contexts: list[dict]) -> list[dict]:
+        """对当前帧的 person_contexts 分配 track_id 并返回。
+
+        贪心匹配：按 IoU 从大到小配对，超过阈值沿用旧 track_id，否则分配新 ID。
+        """
+        if not person_contexts:
+            self._prev_tracks = []
+            return person_contexts
+
+        prev = self._prev_tracks
+        used_prev: set[int] = set()
+        used_curr: set[int] = set()
+
+        pairs: list[tuple[float, int, int]] = []
+        for ci, ctx in enumerate(person_contexts):
+            for pi, pt in enumerate(prev):
+                iou = self._compute_iou(ctx.get("bbox", []), pt.get("bbox", []))
+                if iou >= self.iou_threshold:
+                    pairs.append((iou, ci, pi))
+        pairs.sort(key=lambda t: t[0], reverse=True)
+
+        assignments: dict[int, int] = {}
+        for _iou, ci, pi in pairs:
+            if ci in used_curr or pi in used_prev:
+                continue
+            assignments[ci] = prev[pi]["track_id"]
+            used_curr.add(ci)
+            used_prev.add(pi)
+
+        for ci, ctx in enumerate(person_contexts):
+            tid = assignments.get(ci, self._alloc_id())
+            ctx["track_id"] = tid
+
+        self._prev_tracks = [
+            {"bbox": ctx.get("bbox", []), "track_id": ctx["track_id"]}
+            for ctx in person_contexts
+        ]
+        return person_contexts
+
+    def reset(self):
+        self._prev_tracks = []
+        self._next_id = 0
+
+
 def _make_white_bg_crop(frame: np.ndarray, bbox: list) -> np.ndarray:
     """将帧中人员框外区域替换为白色后裁剪，对应原 YOLOv5 add_white_background 逻辑。
 
@@ -35,6 +112,7 @@ class HKCustomThread(threading.Thread):
         self._running = threading.Event()
         self._running.set()
         self.window = deque(maxlen=getattr(settings, "TEMPORAL_WINDOW_SIZE", 5))
+        self.tracker = SimpleIoUTracker(iou_threshold=0.3)
         self.last_processed_ts = None
         self.last_alert_ts = None
         self._pipeline_error_logged = False
@@ -81,12 +159,19 @@ class HKCustomThread(threading.Thread):
         return False
 
     def _in_roi(self, bbox: list) -> bool:
+        """判断目标是否在 ROI 区域内（中心点策略）。
+
+        只要人框中心点落入 ROI 即视为在监管区域内，
+        不再要求整个人框完全包含于 ROI，避免边缘工人被误排除。
+        """
         roi = getattr(self.camera, "roi", None)
         if not roi:
             return True
         x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
         rx1, ry1, rx2, ry2 = roi
-        return x1 >= rx1 and y1 >= ry1 and x2 <= rx2 and y2 <= ry2
+        return rx1 <= cx <= rx2 and ry1 <= cy <= ry2
 
     def _crop_person(self, frame: np.ndarray, bbox: list):
         """直接裁剪人员框区域，返回裁剪图；坐标越界时做边界修正。"""
@@ -110,8 +195,11 @@ class HKCustomThread(threading.Thread):
         if workwear_detector is None:
             return []
         min_area = getattr(settings, "MIN_PERSON_BOX_AREA", 3000)
+        area_mode = getattr(settings, "MIN_PERSON_AREA_MODE", "absolute")
+        area_ratio_threshold = getattr(settings, "MIN_PERSON_AREA_RATIO", 0.005)
         workwear_conf = getattr(settings, "WORKWEAR_CONF", 0.45)
         use_white_bg = getattr(settings, "USE_WHITE_BG_MASK", False)
+        frame_area = frame.shape[0] * frame.shape[1] if area_mode == "relative" else 0
 
         contexts: list[dict] = []
         for person in persons:
@@ -120,8 +208,12 @@ class HKCustomThread(threading.Thread):
                 continue
             x1, y1, x2, y2 = bbox
             area = max(0, x2 - x1) * max(0, y2 - y1)
-            if area < min_area:
-                continue
+            if area_mode == "relative":
+                if frame_area > 0 and area / frame_area < area_ratio_threshold:
+                    continue
+            else:
+                if area < min_area:
+                    continue
 
             if use_white_bg:
                 crop = _make_white_bg_crop(frame, bbox)
@@ -135,10 +227,16 @@ class HKCustomThread(threading.Thread):
                     conf_threshold=workwear_conf,
                 )
 
-            workwear_labels = getattr(settings, "WORKWEAR_LABELS", [])
-            has_workwear = any(
-                item.get("label") in workwear_labels for item in workwear_items
-            )
+            workwear_labels = set(getattr(settings, "WORKWEAR_LABELS", []))
+            detected_labels = {
+                item.get("label") for item in workwear_items if isinstance(item, dict)
+            }
+            compliance_mode = getattr(settings, "WORKWEAR_COMPLIANCE_MODE", "any")
+            if compliance_mode == "all":
+                required = set(getattr(settings, "WORKWEAR_REQUIRED_LABELS", []))
+                has_workwear = required.issubset(detected_labels) if required else bool(detected_labels & workwear_labels)
+            else:
+                has_workwear = bool(detected_labels & workwear_labels)
 
             contexts.append(
                 {
@@ -215,6 +313,7 @@ class HKCustomThread(threading.Thread):
 
                     persons = self.detect_persons(frame)
                     person_contexts = self.build_person_contexts(frame, persons)
+                    person_contexts = self.tracker.update(person_contexts)
                     self.window.append(
                         {
                             "camera_id": self.camera.id,
@@ -231,6 +330,7 @@ class HKCustomThread(threading.Thread):
 
                     if self._alert_suppressed(timestamp):
                         self.window.clear()
+                        self.tracker.reset()
                         time.sleep(round_sleep)
                         continue
 
@@ -238,6 +338,7 @@ class HKCustomThread(threading.Thread):
                     if triggered:
                         self.last_alert_ts = timestamp
                         self.window.clear()
+                        self.tracker.reset()
                         self.emit_event(triggered)
 
                     time.sleep(round_sleep)

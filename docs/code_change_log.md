@@ -1,5 +1,102 @@
 # 代码修改记录
 
+## 2026-03-26 修正清单实施：规则口径收紧、IoU 跟踪、标签与配置解耦
+
+### 改动背景
+
+基于 `docs/inspection-flask_修正清单.md` 2026-03-26 条目，结合实际数据集条件（工服模型输出标签为 `clothes`，无 worker/customer 区分，模型架构未定型），对检测规则口径、目标跟踪、配置解耦进行系统性修正。
+
+---
+
+### 1. `inspection-flask/settings.py`
+
+**改动类型**：配置修正 + 新增 + 弃用清理
+
+**改动内容**：
+
+- `WORKWEAR_LABELS` 默认值从 `["work_clothes", "reflective_vest", "protective_suit", "uniform_top"]` 修正为 `["clothes"]`，与实际数据集标签对齐
+- 新增 `MONITORED_PERSON_LABELS = ["person"]`：第一阶段检测的监管对象标签，未来模型区分 worker/customer 时改此配置即可
+- 新增 `WORKWEAR_COMPLIANCE_MODE = "any"` 和 `WORKWEAR_REQUIRED_LABELS = ["clothes"]`：支持 any/all 两种合规判定模式
+- 新增 `MIN_PERSON_AREA_MODE = "absolute"` 和 `MIN_PERSON_AREA_RATIO = 0.005`：支持绝对像素面积和相对帧面积比例两种过滤方式
+- `VIDEO_CRT`、`VIDEO_CRT_SECONDS` 标注为已弃用（不进入当前检测链路）
+- `images_num` 标注为已由 `TEMPORAL_WINDOW_SIZE` 替代
+
+**改动原因**：原 `WORKWEAR_LABELS` 默认值与实际模型输出不匹配，导致合规判定永远不命中；新增配置项使规则口径、面积过滤、标签映射均可通过配置调整，不需改代码。
+
+---
+
+### 2. `inspection-flask/utils/models.py`
+
+**改动类型**：标签解耦 + IMGSZ 接入
+
+**改动内容**：
+
+- `PersonDetector.infer()`：将硬编码 `if label != "person"` 改为 `if label not in monitored`，其中 `monitored` 从 `settings.MONITORED_PERSON_LABELS` 读取
+- `PersonDetector.infer()` 和 `WorkwearDetector.infer()`：新增 `imgsz` 参数，从 `settings.IMGSZ` 读取并传入 ultralytics 调用
+
+**改动原因**：硬编码 `"person"` 无法适配输出 `worker`/`customer` 等类别的模型；`IMGSZ` 原来只是配置项但未接入推理调用，调参无效。
+
+---
+
+### 3. `inspection-flask/applications/common/hk_custom_threading_plus.py`
+
+**改动类型**：新增 IoU 跟踪器 + ROI 策略升级 + 面积模式支持 + 合规判定模式同步
+
+**改动内容**：
+
+**新增 `SimpleIoUTracker` 类**：
+- 基于 IoU 的帧间目标关联，为每个人员分配稳定的 `track_id`
+- 贪心匹配：按 IoU 从大到小配对，超过阈值（默认 0.3）沿用旧 track_id，否则分配新 ID
+- `update(person_contexts)` 方法：接收当前帧的 person_contexts，注入 `track_id` 字段后返回
+- `reset()` 方法：窗口清空时同步重置跟踪状态
+
+**`HKCustomThread.__init__`**：
+- 初始化 `self.tracker = SimpleIoUTracker(iou_threshold=0.3)`
+
+**`_in_roi()`**：
+- 从"全框硬包含"改为"中心点落入 ROI"策略，边缘站位、半身入镜的工人不再被误排除
+
+**`build_person_contexts()`**：
+- 面积过滤支持 `absolute`/`relative` 两种模式
+- `has_workwear` 判定同步支持 `any`/`all` 合规模式
+
+**`run()`**：
+- `build_person_contexts()` 之后调用 `self.tracker.update()` 注入 track_id
+- 窗口 clear 时同步调用 `self.tracker.reset()`
+
+**改动原因**：原 ROI 判定过严导致边缘目标漏报；无跟踪器时，不同人拼出的违规帧可累计触发误报；面积固定阈值在不同机位分辨率下不稳定。
+
+---
+
+### 4. `inspection-flask/violation_module/vio_workwear_missing.py`
+
+**改动类型**：时序判定从按帧改为按人（track 维度）
+
+**改动内容**：
+
+- `run()` 方法完全重写：不再统计全局违规帧数/有效帧数，改为按 `track_id` 分组统计
+  - 每个 track 独立维护出现帧数和违规帧数
+  - 只有某个 track 的 `违规帧数 / 出现帧数 >= trigger_ratio` 才触发告警
+  - 不同人分散出现在窗口内不再互相累计
+- `_has_compliant_workwear()` 支持 `any`/`all` 两种合规判定模式（第 2 批已改）
+
+**改动原因**：原按帧比例判定无法区分"同一人连续违规"和"不同人拼出的违规帧"，解释性弱、误报率高。
+
+---
+
+### 5. `inspection-flask/main.py`
+
+**改动类型**：同步适配全部配置变更
+
+**改动内容**：
+
+- `_build_person_contexts()` 同步支持 `MIN_PERSON_AREA_MODE`（absolute/relative）和 `WORKWEAR_COMPLIANCE_MODE`（any/all）
+- `cmd_check()` 配置打印新增 `IMGSZ`、`MONITORED_PERSON_LABELS`、`COMPLIANCE_MODE`、`MIN_PERSON_AREA_MODE`
+
+**改动原因**：保持诊断工具与正式检测链路行为一致。
+
+---
+
 ## 2026-03-25 重写 main.py 为 YOLOv11 工服检测独立诊断工具
 
 ### 改动背景

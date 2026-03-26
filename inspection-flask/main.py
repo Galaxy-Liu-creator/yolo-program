@@ -85,9 +85,14 @@ def _build_person_contexts(
 ) -> list[dict]:
     """复用与 HKCustomThread.build_person_contexts 相同的逻辑构建人员上下文。"""
     min_area = getattr(settings, "MIN_PERSON_BOX_AREA", 3000)
+    area_mode = getattr(settings, "MIN_PERSON_AREA_MODE", "absolute")
+    area_ratio_threshold = getattr(settings, "MIN_PERSON_AREA_RATIO", 0.005)
     workwear_conf = getattr(settings, "WORKWEAR_CONF", 0.45)
     use_white_bg = getattr(settings, "USE_WHITE_BG_MASK", False)
-    workwear_labels = getattr(settings, "WORKWEAR_LABELS", [])
+    workwear_labels = set(getattr(settings, "WORKWEAR_LABELS", []))
+    compliance_mode = getattr(settings, "WORKWEAR_COMPLIANCE_MODE", "any")
+    required_labels = set(getattr(settings, "WORKWEAR_REQUIRED_LABELS", []))
+    frame_area = frame.shape[0] * frame.shape[1] if area_mode == "relative" else 0
 
     contexts: list[dict] = []
     for person in persons:
@@ -96,8 +101,12 @@ def _build_person_contexts(
             continue
         x1, y1, x2, y2 = bbox
         area = max(0, x2 - x1) * max(0, y2 - y1)
-        if area < min_area:
-            continue
+        if area_mode == "relative":
+            if frame_area > 0 and area / frame_area < area_ratio_threshold:
+                continue
+        else:
+            if area < min_area:
+                continue
 
         if use_white_bg:
             crop = _make_white_bg_crop(frame, bbox)
@@ -108,9 +117,12 @@ def _build_person_contexts(
         if crop is not None and crop.size > 0:
             workwear_items = workwear_model.infer(crop, conf_threshold=workwear_conf)
 
-        has_workwear = any(
-            item.get("label") in workwear_labels for item in workwear_items
-        )
+        detected = {item.get("label") for item in workwear_items if isinstance(item, dict)}
+        if compliance_mode == "all":
+            has_workwear = required_labels.issubset(detected) if required_labels else bool(detected & workwear_labels)
+        else:
+            has_workwear = bool(detected & workwear_labels)
+
         contexts.append(
             {
                 "bbox": bbox,
@@ -206,14 +218,18 @@ def cmd_check(_args: argparse.Namespace) -> None:
     print("=" * 60)
 
     print(f"\n[配置]")
-    print(f"  PERSON_WEIGHT      : {settings.PERSON_WEIGHT}")
-    print(f"  WORKWEAR_WEIGHT    : {settings.WORKWEAR_WEIGHT}")
-    print(f"  PERSON_CONF        : {getattr(settings, 'PERSON_CONF', 0.55)}")
-    print(f"  WORKWEAR_CONF      : {getattr(settings, 'WORKWEAR_CONF', 0.45)}")
-    print(f"  WORKWEAR_LABELS    : {getattr(settings, 'WORKWEAR_LABELS', [])}")
-    print(f"  MIN_PERSON_BOX_AREA: {getattr(settings, 'MIN_PERSON_BOX_AREA', 3000)}")
-    print(f"  TEMPORAL_WINDOW    : {getattr(settings, 'TEMPORAL_WINDOW_SIZE', 5)}")
-    print(f"  TRIGGER_RATIO      : {getattr(settings, 'TEMPORAL_TRIGGER_RATIO', 0.6)}")
+    print(f"  PERSON_WEIGHT          : {settings.PERSON_WEIGHT}")
+    print(f"  WORKWEAR_WEIGHT        : {settings.WORKWEAR_WEIGHT}")
+    print(f"  IMGSZ                  : {getattr(settings, 'IMGSZ', 640)}")
+    print(f"  PERSON_CONF            : {getattr(settings, 'PERSON_CONF', 0.55)}")
+    print(f"  WORKWEAR_CONF          : {getattr(settings, 'WORKWEAR_CONF', 0.45)}")
+    print(f"  MONITORED_PERSON_LABELS: {getattr(settings, 'MONITORED_PERSON_LABELS', ['person'])}")
+    print(f"  WORKWEAR_LABELS        : {getattr(settings, 'WORKWEAR_LABELS', [])}")
+    print(f"  COMPLIANCE_MODE        : {getattr(settings, 'WORKWEAR_COMPLIANCE_MODE', 'any')}")
+    print(f"  MIN_PERSON_AREA_MODE   : {getattr(settings, 'MIN_PERSON_AREA_MODE', 'absolute')}")
+    print(f"  MIN_PERSON_BOX_AREA    : {getattr(settings, 'MIN_PERSON_BOX_AREA', 3000)}")
+    print(f"  TEMPORAL_WINDOW        : {getattr(settings, 'TEMPORAL_WINDOW_SIZE', 5)}")
+    print(f"  TRIGGER_RATIO          : {getattr(settings, 'TEMPORAL_TRIGGER_RATIO', 0.6)}")
 
     person_ok = Path(settings.PERSON_WEIGHT).exists()
     workwear_ok = Path(settings.WORKWEAR_WEIGHT).exists()

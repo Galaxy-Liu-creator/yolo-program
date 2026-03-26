@@ -33,8 +33,18 @@ WORKWEAR_CONF = 0.45   # 工服检测置信度阈值
 # CLOTH_CONF  = 0.45
 
 # ─── 工服检测业务配置 ──────────────────────────────────────────────────────────
-# 合规工服类别列表（模型输出的 label 名称，命中任一即视为穿戴合规）
-WORKWEAR_LABELS = ["work_clothes", "reflective_vest", "protective_suit", "uniform_top"]
+# 第一阶段检测中视为"监管对象"的类别标签（模型输出不在此列表中的目标将被忽略）
+# 当前模型只输出 person；未来若模型能区分 worker/customer，改为 ["worker"]
+MONITORED_PERSON_LABELS = ["person"]
+
+# 合规工服类别列表（模型输出的 label 名称）
+WORKWEAR_LABELS = ["clothes"]
+
+# 工服合规判定模式：
+#   "any"  — 命中 WORKWEAR_LABELS 中任一标签即合规（当前默认，适用于只有单个 clothes 标签的数据集）
+#   "all"  — 必须命中 WORKWEAR_REQUIRED_LABELS 中全部标签才合规（适用于标注体系拆分为多部件后）
+WORKWEAR_COMPLIANCE_MODE = "any"
+WORKWEAR_REQUIRED_LABELS = ["clothes"]
 
 # 工服检测前的人员区域预处理方式
 # True：将帧中人员框外区域替换为白色后裁剪（对应原 YOLOv5 add_white_background 逻辑，
@@ -42,8 +52,12 @@ WORKWEAR_LABELS = ["work_clothes", "reflective_vest", "protective_suit", "unifor
 # False：直接裁剪人员框区域（推荐默认，适用于在真实场景数据上训练的 YOLOv11 模型）
 USE_WHITE_BG_MASK = False
 
-# 人员框最小面积（像素²），小于此值的人员目标视为过远/过小，跳过检测
+# 人员框最小面积过滤
+#   "absolute" — 使用固定像素面积 MIN_PERSON_BOX_AREA（默认，适合固定机位固定分辨率）
+#   "relative" — 使用人框面积占帧面积比例 MIN_PERSON_AREA_RATIO（适合多机位不同分辨率）
+MIN_PERSON_AREA_MODE = "absolute"
 MIN_PERSON_BOX_AREA = 3000
+MIN_PERSON_AREA_RATIO = 0.005
 
 # 违规规则编码与名称（写入数据库 rule_code / rule_name 字段）
 WORKWEAR_VIOLATION_TYPE = "workwear_missing"
@@ -71,16 +85,16 @@ LOG_DIR = BASE_DIR.joinpath("logs")
 LOG_DIR.mkdir(exist_ok=True, parents=True)
 LOG_FILE = LOG_DIR / (datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S") + ".log")
 
-VIDEO_CRT         = 1  # 视频帧数
-VIDEO_CRT_SECONDS = 1  # 一次处理单位秒
+# 以下为旧轮次控制参数，已弃用，不进入当前检测链路
+# VIDEO_CRT         = 1   # 原视频帧数控制，已弃用
+# VIDEO_CRT_SECONDS = 1   # 原单次处理时长控制，已弃用
 
 # ─── 轮次采集调度参数 ──────────────────────────────────────────────────────────
 # 每次抓图的时间间隔（秒）
 get_image_interval = 110
 # 完成一轮检测后的额外休眠（秒），0 表示不额外等待
 round_interval = 0
-# 每轮累计帧数
-images_num = 5
+# images_num = 5  # 已由 TEMPORAL_WINDOW_SIZE 替代，不再使用
 # 连续无人时的长休眠时长（秒）
 rest_time = 20 * 60
 

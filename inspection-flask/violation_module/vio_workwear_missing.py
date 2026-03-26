@@ -13,8 +13,8 @@ class WorkwearMissingViolation(BaseVio):
 
     规则口径：
     1. 只统计 ROI 内、面积满足阈值的人体目标。
-    2. 单帧内只要存在一个有效人员未命中任一合规工服标签，即记为违规帧。
-    3. 使用“违规帧数 / 有效人员帧数”做时间窗判定，避免空帧稀释触发比例。
+    2. 按 track_id 维度做时序判定：同一人连续违规才触发，不同人拼出的违规帧不累计。
+    3. 任一 track 的「违规帧数 / 该 track 出现帧数 >= trigger_ratio」即触发告警。
     """
 
     rule_code = "workwear_missing"
@@ -37,36 +37,48 @@ class WorkwearMissingViolation(BaseVio):
             self.plot_targets.clear()
             return None
 
-        violation_frame_indices: list[int] = []
-        valid_frame_count = 0
+        track_stats: dict[int, dict] = {}
 
         for frame_idx, frame_item in enumerate(self.targets):
             persons = self._extract_persons(frame_item)
-            frame_has_valid_person = False
-            frame_has_violation = False
-
             for person in persons:
                 if not self._is_valid_person(person, min_area):
                     continue
 
-                frame_has_valid_person = True
-                if self._has_compliant_workwear(person, workwear_labels):
+                track_id = person.get("track_id")
+                if track_id is None:
                     continue
 
-                frame_has_violation = True
-                self._add_person_to_plot(frame_idx, person)
+                if track_id not in track_stats:
+                    track_stats[track_id] = {
+                        "appear": 0,
+                        "violation": 0,
+                        "best_conf": 0.0,
+                    }
 
-            if frame_has_valid_person:
-                valid_frame_count += 1
-            if frame_has_violation:
-                violation_frame_indices.append(frame_idx)
+                track_stats[track_id]["appear"] += 1
 
-        if valid_frame_count == 0:
+                if not self._has_compliant_workwear(person, workwear_labels):
+                    track_stats[track_id]["violation"] += 1
+                    self._add_person_to_plot(frame_idx, person)
+                    conf = float(person.get("confidence", 0.0))
+                    if conf > track_stats[track_id]["best_conf"]:
+                        track_stats[track_id]["best_conf"] = conf
+
+        if not track_stats:
             self.plot_targets.clear()
             return None
 
-        violation_ratio = len(violation_frame_indices) / valid_frame_count
-        if violation_ratio < trigger_ratio or not self.plot_targets:
+        triggered_track = None
+        for tid, stats in track_stats.items():
+            if stats["appear"] == 0:
+                continue
+            ratio = stats["violation"] / stats["appear"]
+            if ratio >= trigger_ratio:
+                triggered_track = tid
+                break
+
+        if triggered_track is None or not self.plot_targets:
             self.plot_targets.clear()
             return None
 
@@ -134,13 +146,20 @@ class WorkwearMissingViolation(BaseVio):
         if not isinstance(workwear_items, list):
             return False
 
-        for item in workwear_items:
-            if not isinstance(item, dict):
-                continue
-            label = str(item.get("label", "")).strip()
-            if label in workwear_labels:
-                return True
-        return False
+        detected = {
+            str(item.get("label", "")).strip()
+            for item in workwear_items
+            if isinstance(item, dict)
+        }
+
+        mode = getattr(settings, "WORKWEAR_COMPLIANCE_MODE", "any")
+        if mode == "all":
+            required = set(getattr(settings, "WORKWEAR_REQUIRED_LABELS", []))
+            if not required:
+                return bool(detected & workwear_labels)
+            return required.issubset(detected)
+
+        return bool(detected & workwear_labels)
 
     def _add_person_to_plot(self, frame_idx: int, person: dict) -> None:
         bbox = person.get("bbox", [])
